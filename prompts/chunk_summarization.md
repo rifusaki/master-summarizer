@@ -41,3 +41,10 @@ Respond with a JSON object containing:
 - **Image descriptions**: If the chunk includes image/chart/map descriptions (from preprocessing), summarize the key data points and reference the visual type.
 - **Section context**: Use the section heading path provided to understand where this chunk fits in the overall document structure.
 - **Brevity vs. fidelity**: When in doubt, err on the side of including information rather than omitting it. The central summarizer will handle further compression.
+
+## Language Requirements
+
+- **All output must be in Spanish.** This includes the `summary` field, all `key_facts[].fact` values, `numeric_table[].label` and `numeric_table[].context` values, and `uncertainties[]` entries.
+- Use natural, fluent Colombian Spanish. Avoid anglicisms or literal translations from English.
+- Preserve the original Spanish terminology from the source documents — do not translate terms like "vereda", "corregimiento", "resguardo indígena", "componente", "diagnóstico", etc.
+- Use proper Spanish punctuation and formatting (e.g., decimal comma for numbers when the source uses it, quotation marks «»).

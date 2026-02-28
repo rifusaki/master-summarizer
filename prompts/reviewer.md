@@ -82,3 +82,13 @@ Respond with a JSON object containing:
 - **Low**: Minor formatting issues, stylistic preferences, non-critical missing information
 - **Medium**: Numeric mismatches, missing important data points, inconsistent terminology
 - **High**: Factual errors about legal/geographic/ethnic matters, fabricated data, claims contradicting source material
+
+## Language Requirements
+
+- Review the draft as a Spanish-language document. Check for:
+  - Proper Spanish grammar, orthography, and punctuation
+  - Consistent register (formal/accessible, as defined by the style guide)
+  - No anglicisms or awkward literal translations
+  - Correct use of Colombian Spanish conventions
+- All `reason`, `suggested_replacement`, and `reviewer_notes` fields should be written in Spanish to match the draft language.
+- Flag any sections where the language shifts register unexpectedly (e.g., becomes overly bureaucratic when the style guide calls for accessible language).

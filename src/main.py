@@ -26,6 +26,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
 
 from src.config import (
+    PROMPTS_DIR,
     REVIEW_DIR,
     ensure_output_dirs,
     get_raw_documents,
@@ -483,7 +484,22 @@ class Pipeline:
 
         console.print(f"Learning style from {len(example_docs)} example documents...")
 
-        guide = await self._style_learner.learn_style(example_docs)
+        # Load manual style guide if available
+        manual_guide_path = PROMPTS_DIR / "manual_style_guide.md"
+        communication_guidelines = ""
+        if manual_guide_path.exists():
+            communication_guidelines = manual_guide_path.read_text(encoding="utf-8")
+            console.print(
+                f"[green]Loaded manual style guide ({len(communication_guidelines)} chars)[/]"
+            )
+
+        guide = await self._style_learner.learn_style(
+            example_docs, communication_guidelines=communication_guidelines
+        )
+
+        # Store the manual guidelines in the guide for downstream use
+        if communication_guidelines:
+            guide.communication_guidelines = communication_guidelines
 
         # Track budget
         self.budget.record_usage(

@@ -33,3 +33,9 @@ Respond with a JSON object matching the required schema. Key fields:
 - **Completeness over brevity**: Include every legible data point.
 - **No hallucination**: If you cannot read a value, say so. Never invent numbers.
 - **Context awareness**: These are Colombian municipal planning documents. Expect references to: veredas, corregimientos, resguardos indígenas, zonas de amenaza, usos del suelo, equipamientos, vías, servicios públicos, and similar POT terminology.
+
+## Language Requirements
+
+- **Write the `description` field in Spanish.** Since the source documents are in Spanish and the downstream pipeline processes everything in Spanish, your visual descriptions must also be in Spanish.
+- Preserve all original Spanish text found in images (labels, titles, legends, annotations) exactly as written.
+- Use proper Spanish terminology for geographic, technical, and legal concepts.

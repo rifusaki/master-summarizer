@@ -39,3 +39,13 @@ Write the section as formatted prose (Markdown). Include:
 - Sub-headings as needed to organize the content
 
 Do NOT output JSON. Write natural prose following the style guide.
+
+## Language Requirements
+
+- **Write entirely in Spanish** — all prose, headings, bullets, table headers, and any other text must be in Colombian Spanish.
+- Use a tone that is cercano, didáctico y directo — accessible to citizens, not just government officials.
+- Eliminate bureaucratic language and legal jargon. If a technical term is necessary, explain it immediately with a simple analogy.
+- Use short, clear sentences and everyday vocabulary.
+- Preserve original Spanish terminology from source documents (veredas, corregimientos, resguardos, componentes, etc.).
+- Use proper Spanish punctuation throughout.
+- When the manual style guide (directrices de comunicación) is provided, follow those instructions with the highest priority — they define the target audience and communication approach.

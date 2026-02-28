@@ -83,3 +83,9 @@ Respond with a JSON object containing:
 - **Actionable**: Rules must be specific enough that another AI agent can follow them to produce matching output.
 - **Comprehensive**: Cover all dimensions listed above. Missing a category weakens the style transfer.
 - **Prioritized**: Mark the most important rules as high priority. These will be enforced strictly during synthesis.
+
+## Language Requirements
+
+- Analyze the examples as Spanish-language documents. Your style rules should address Spanish-specific conventions (gender agreement, formal/informal register, punctuation such as «» and ¿?, etc.).
+- The inferred style guide itself may be written in English for machine readability, but all `examples_do` and `examples_dont` fields must preserve the original Spanish text from the source documents.
+- Pay special attention to how the source documents handle the balance between technical accuracy and citizen accessibility — this is a key style dimension for POT documents.

@@ -73,3 +73,11 @@ Expect content about:
 - Gestión del Riesgo de Desastres (amenazas, vulnerabilidad, riesgo)
 - Instrumentos de Planificación y Gestión Financiera
 - Diagnóstico territorial
+
+## Language Requirements
+
+- **All slide content must be in Spanish** — titles, bullets, visual descriptions, speaker notes, and any other text.
+- Use clear, accessible Colombian Spanish. The slides are for community presentation, not technical audiences.
+- Eliminate jargon — use simple language that any citizen can understand.
+- If technical terms appear, the speaker notes should include a brief plain-language explanation.
+- Use proper Spanish punctuation and formatting throughout.

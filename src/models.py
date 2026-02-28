@@ -231,6 +231,8 @@ class StyleGuide(BaseModel):
     # Tone
     tone_description: str = ""
     target_reader: str = ""
+    # Manual communication guidelines (user-provided, merged with inferred rules)
+    communication_guidelines: str = ""
     # Human-readable rubric
     reviewer_checklist: list[str] = Field(default_factory=list)
     # Generation metadata

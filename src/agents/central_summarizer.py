@@ -349,6 +349,12 @@ Include all relevant data points and key facts from the summaries."""
             f"Citation Style: {guide.citation_style}",
         ]
 
+        if guide.communication_guidelines:
+            parts.append(
+                f"\n## Directrices de Comunicación (prioridad alta)\n"
+                f"{guide.communication_guidelines}"
+            )
+
         if guide.rules:
             parts.append("\nKey Style Rules:")
             for r in guide.rules:

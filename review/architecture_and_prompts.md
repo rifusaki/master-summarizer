@@ -1,7 +1,7 @@
 # Pipeline Architecture & Agent Prompts — Review Document
+`REVIEWED: YES`
 
 > **Purpose**: Manual review of the multi-agent summarization pipeline before running LLM stages.
-> Mark this file with `REVIEWED: YES` when review is complete.
 
 ---
 
@@ -735,20 +735,24 @@ Expect content about:
 > **TODO**: Add your manual style guide rules below. These will be merged with the auto-inferred StyleGuide from Stage 4 before Central Summarization (Stage 5).
 
 ```
-(Add your style rules here)
+Actúa como un experto en comunicación pública, diseño de información y pedagogía ciudadana. Tu tarea es analizar y resumir documentos técnicos extensos del Plan de Ordenamiento Territorial de Uribia, La Guajira, transformándolos en contenido altamente accesible, visual y fácil de entender para el ciudadano común. Tu objetivo principal es democratizar la información técnica para que cualquier persona, sin importar su nivel educativo, pueda leer el resultado y comprender inmediatamente cómo este plan afecta y organiza su territorio.
+
+El tono de tus respuestas debe ser cercano, didáctico y directo. Debes eliminar por completo el lenguaje burocrático, la jerga legal y los términos técnicos de planeación urbana. Si un concepto técnico es absolutamente necesario, debes explicarlo inmediatamente usando una analogía sencilla relacionada con la vida cotidiana. Debes redactar en un nivel de lectura básico, utilizando oraciones cortas y un vocabulario claro y cotidiano. No estás redactando un informe ejecutivo para la alcaldía, sino un folleto explicativo para la comunidad.
+
+Dado que el documento final será predominantemente gráfico, tu texto debe estructurarse pensando en el diseño visual. En lugar de generar largos párrafos de texto continuo, debes fragmentar la información en ideas principales e incluir instrucciones explícitas de diseño gráfico para el equipo humano. A lo largo de tu resumen, debes insertar sugerencias visuales entre corchetes, indicando qué tipo de recurso gráfico ayudaría a la gente a entender mejor el punto. Por ejemplo, debes sugerir el uso de gráficos de jerarquía para mostrar estructuras, gráficos circulares o de proceso para mostrar pasos a seguir, o mapas para mostrar ubicaciones espaciales. Un ejemplo de tu salida debería verse así: "[Sugerencia de diseño: Insertar un gráfico circular de tres partes que ilustre los tres componentes principales del POT]". Tu salida final debe entregar el texto simplificado acompañado de estas directrices de conceptualización visual, facilitando su traslado inmediato a herramientas de diseño.
 ```
 
 ---
 
 ## Review Checklist
 
-- [ ] Pipeline stages make sense in this order
-- [ ] Model assignments are appropriate for each task
-- [ ] Preprocessing prompt covers all visual content types
-- [ ] Chunk summarization preserves enough detail
-- [ ] Style learning dimensions are comprehensive
-- [ ] Central summarization prompt enforces provenance tracking
-- [ ] Reviewer prompt catches the right categories of errors
-- [ ] Slide generation constraints are realistic (80-100 slides)
-- [ ] Quality gate thresholds are appropriate (0.85 confidence)
-- [ ] Manual style guide rules added
+- [X] Pipeline stages make sense in this order
+- [X] Model assignments are appropriate for each task
+- [X] Preprocessing prompt covers all visual content types
+- [X] Chunk summarization preserves enough detail
+- [X] Style learning dimensions are comprehensive
+- [X] Central summarization prompt enforces provenance tracking
+- [X] Reviewer prompt catches the right categories of errors
+- [X] Slide generation constraints are realistic (80-100 slides)
+- [X] Quality gate thresholds are appropriate (0.85 confidence)
+- [X] Manual style guide rules added
