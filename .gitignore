@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Environment
+.env
+
+# Data and outputs (large files, not for git)
+data/chroma/
+output/
+review/*
+!review/architecture_and_prompts.md
+
+# Input data (too large for git)
+input/raw_data/
+input/style_examples/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
