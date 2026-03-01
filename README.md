@@ -80,17 +80,26 @@ The pipeline runs stage-by-stage, pausing at checkpoints for confirmation. Type 
 # Override the preprocessing model for this run only (e.g. after quota exhaustion)
 uv run summarizer --preprocess-model google/gemini-3-pro-preview
 
-# Retry only failed image descriptions (combine with --preprocess-model to use a different model)
+# Retry only failed image descriptions
 uv run summarizer --retry-failed-images
+
+# Retry failed images with a specific model (most common recovery workflow)
 uv run summarizer --retry-failed-images --preprocess-model google/gemini-3-pro-preview
 uv run summarizer --retry-failed-images --preprocess-model openrouter/google/gemini-3-pro-preview
 
 # Retry only failed/low-confidence chunk summaries
 uv run summarizer --retry-failed-chunks
-
-# With --retry-failed-images: include failures from all prior runs, not just the most recent
-uv run summarizer --retry-failed-images --all-runs
 ```
+
+**Flag compatibility notes:**
+
+| Flag combination | Works? | Notes |
+|-----------------|--------|-------|
+| `--retry-failed-images --preprocess-model X` | ✅ | Correct recovery workflow |
+| `--retry-failed-images --all-runs` | ✅ | `--all-runs` is accepted but currently a no-op — retry already covers all runs by default |
+| `--retry-failed-images --all-runs --preprocess-model X` | ✅ | Same as above; `--preprocess-model` applies correctly |
+| `--retry-failed-chunks --preprocess-model X` | ⚠️ | `--preprocess-model` is silently ignored — it only controls Gemini preprocessing, not chunk summarization |
+| `--retry-failed-chunks --all-runs` | ⚠️ | `--all-runs` is silently ignored — it only applies to `--retry-failed-images` |
 
 ## Output
 
@@ -131,8 +140,8 @@ src/
     chunk_summarizer.py      # Chunk-level summarization (Sonnet)
     style_learner.py         # Style guide inference (Opus)
     central_summarizer.py    # Master draft synthesis (Opus)
-    reviewer.py              # Quality review (GPT-5.3)
-    slide_generator.py       # Slide outline generation (GPT-5.3)
+    reviewer.py              # Quality review (GPT-5.2)
+    slide_generator.py       # Slide outline generation (GPT-5.2)
   parsers/
     docx_parser.py           # DOCX document parser
     pdf_parser.py            # PDF document parser (PyMuPDF)
