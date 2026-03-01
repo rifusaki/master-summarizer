@@ -125,7 +125,7 @@ FALLBACK_MODELS: dict[str, list[ModelConfig]] = {
     "preprocessing": [
         ModelConfig(
             provider_id="google",
-            model_id="gemini-3-pro",  # validate exact id in your OpenCode instance
+            model_id="gemini-3-pro-preview",
             context_window=1_048_576,
             max_output=65_536,
             supports_images=True,
