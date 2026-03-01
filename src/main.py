@@ -1206,6 +1206,23 @@ def _is_failed_image(artifact: Any) -> bool:
     return False
 
 
+def _is_low_confidence_image(artifact: Any, threshold: float) -> bool:
+    """
+    Return True if an image was described successfully but with confidence
+    below the given threshold.
+
+    Only targets artifacts with preprocess_status == success, so it is
+    completely disjoint from _is_failed_image — running both flags on the
+    same dataset will never double-process the same image.
+    """
+    status = artifact.metadata.get("preprocess_status")
+    if status != ImagePreprocessStatus.SUCCESS:
+        return False
+    if not artifact.image_base64:
+        return False
+    return artifact.confidence < threshold
+
+
 async def _retry_failed_images_async(
     all_runs: bool = False,
     preprocess_model: str | None = None,
@@ -1354,6 +1371,158 @@ async def _retry_failed_images_async(
         await client.stop()
 
 
+async def _retry_low_confidence_async(
+    threshold: float = 0.5,
+    preprocess_model: str | None = None,
+) -> None:
+    """
+    Async impl of --retry-low-confidence mode.
+
+    Loads all saved parse results, identifies image artifacts that were
+    successfully described but with confidence below ``threshold``, and
+    re-runs preprocessing only on those. Never touches failed/pending
+    images (use --retry-failed-images for those).
+
+    Args:
+        threshold: Re-process images whose confidence is strictly below
+            this value. Default 0.5.
+        preprocess_model: Optional "provider/model" override.
+    """
+    model_note = f" (model: {preprocess_model})" if preprocess_model else ""
+    console.print(
+        Panel(
+            f"[bold]Retry Low-Confidence Images Mode[/]\n"
+            f"Re-describing images with confidence < {threshold}{model_note}.",
+            style="bold yellow",
+        )
+    )
+
+    store = DocumentStore()
+    client = OpenCodeClient()
+    await client.start()
+    preprocessor = PreprocessorAgent(client)
+
+    if preprocess_model:
+        parts = preprocess_model.split("/", 1)
+        if len(parts) == 2:
+            from src.config import ModelConfig
+
+            override = ModelConfig(
+                provider_id=parts[0],
+                model_id=parts[1],
+                context_window=1_048_576,
+                max_output=65_536,
+                supports_images=True,
+                supports_pdf=True,
+            )
+            preprocessor.set_active_model(override)
+            console.print(
+                f"[yellow]Preprocessing model overridden: {preprocess_model}[/]"
+            )
+
+    try:
+        results = store.load_all_parse_results()
+        if not results:
+            console.print(
+                "[red]No parse results found in output/preprocessed/. "
+                "Run the full pipeline first.[/]"
+            )
+            return
+
+        total_low_conf = sum(
+            1
+            for r in results
+            for a in r.artifacts
+            if _is_low_confidence_image(a, threshold)
+        )
+
+        if total_low_conf == 0:
+            console.print(
+                f"[green]No images found with confidence < {threshold}. Nothing to retry.[/]"
+            )
+            return
+
+        console.print(
+            f"Found [bold]{total_low_conf}[/] low-confidence images "
+            f"(confidence < {threshold}) across {len(results)} documents."
+        )
+
+        recovered = 0
+        still_low = 0
+
+        for result in results:
+            low_conf_ids = {
+                a.artifact_id
+                for a in result.artifacts
+                if _is_low_confidence_image(a, threshold)
+            }
+            if not low_conf_ids:
+                continue
+
+            logger.info(
+                "Retrying %d low-confidence images in %s",
+                len(low_conf_ids),
+                result.source_file,
+            )
+
+            before_high_conf = sum(
+                1
+                for a in result.artifacts
+                if a.metadata.get("preprocess_status") == ImagePreprocessStatus.SUCCESS
+                and a.confidence >= threshold
+            )
+
+            async def _save(r: DocumentParseResult) -> None:
+                store.save_parse_result(r)
+
+            try:
+                await preprocessor.process_document(
+                    result,
+                    target_artifact_ids=low_conf_ids,
+                    on_image_done=_save,
+                )
+            except ModelExhaustionError as exc:
+                console.print(
+                    f"[red]Model exhaustion during retry: {exc}[/]\n"
+                    f"Partial progress saved."
+                )
+                break
+
+            after_high_conf = sum(
+                1
+                for a in result.artifacts
+                if a.metadata.get("preprocess_status") == ImagePreprocessStatus.SUCCESS
+                and a.confidence >= threshold
+            )
+            doc_recovered = after_high_conf - before_high_conf
+            doc_still_low = len(low_conf_ids) - doc_recovered
+            recovered += doc_recovered
+            still_low += doc_still_low
+
+            logger.info(
+                "%s: improved=%d, still_low_conf=%d",
+                result.source_file,
+                doc_recovered,
+                doc_still_low,
+            )
+
+        console.print(
+            Panel(
+                f"Retry complete.\n"
+                f"  Improved (now ≥ {threshold}): [bold green]{recovered}[/]\n"
+                f"  Still below threshold: [bold yellow]{still_low}[/]\n"
+                f"  Total token cost: "
+                f"input={preprocessor._total_input_tokens:,}, "
+                f"output={preprocessor._total_output_tokens:,}",
+                title="Low-Confidence Retry Summary",
+                style="cyan",
+            )
+        )
+
+    finally:
+        await client.stop()
+
+
 async def _retry_failed_chunks_async() -> None:
     """
     Retry only failed/low-confidence chunk summaries.
@@ -1474,6 +1643,22 @@ def main() -> None:
             "Example: --preprocess-model google/gemini-3-pro-preview"
         ),
     )
+    parser.add_argument(
+        "--retry-low-confidence",
+        action="store_true",
+        help=(
+            "Retry image descriptions that succeeded but with confidence below "
+            "--confidence-threshold (default 0.5). Only targets images with "
+            "preprocess_status=success — never overlaps with --retry-failed-images."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.5,
+        metavar="FLOAT",
+        help="Confidence threshold for --retry-low-confidence (default: 0.5).",
+    )
     args = parser.parse_args()
 
     _configure_logging()
@@ -1498,6 +1683,15 @@ def main() -> None:
 
     if args.retry_failed_chunks:
         asyncio.run(_retry_failed_chunks_async())
+        return
+
+    if args.retry_low_confidence:
+        asyncio.run(
+            _retry_low_confidence_async(
+                threshold=args.confidence_threshold,
+                preprocess_model=args.preprocess_model,
+            )
+        )
         return
 
     pipeline = Pipeline()
