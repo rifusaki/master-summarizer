@@ -102,13 +102,13 @@ MODELS: dict[str, ModelConfig] = {
     ),
     "reviewer": ModelConfig(
         provider_id="azure-gpt",
-        model_id="gpt-5.3-codex",
-        context_window=200_000,  # not specified, estimate
+        model_id="gpt-5.2",
+        context_window=200_000,
         max_output=100_000,
     ),
     "slide_generation": ModelConfig(
         provider_id="azure-gpt",
-        model_id="gpt-5.3-codex",
+        model_id="gpt-5.2",
         context_window=200_000,
         max_output=100_000,
     ),
@@ -141,6 +141,22 @@ FALLBACK_MODELS: dict[str, list[ModelConfig]] = {
             context_window=200_000,
             max_output=64_000,
             supports_images=True,
+        ),
+    ],
+    "reviewer": [
+        ModelConfig(
+            provider_id="github-copilot",
+            model_id="gpt-5.2",
+            context_window=200_000,
+            max_output=100_000,
+        ),
+    ],
+    "slide_generation": [
+        ModelConfig(
+            provider_id="github-copilot",
+            model_id="gpt-5.2",
+            context_window=200_000,
+            max_output=100_000,
         ),
     ],
 }
