@@ -30,14 +30,20 @@ from src.config import (
     STYLE_GUIDE_DIR,
     ensure_output_dirs,
 )
+
+# Sub-directories for incremental section persistence
+DRAFT_SECTIONS_DIR = DRAFTS_DIR / "sections"
+SLIDE_SECTIONS_DIR = SLIDES_DIR / "sections"
 from src.models import (
     AuditEntry,
     ChunkSummary,
     Chunk,
     DocumentParseResult,
+    DraftSection,
     MasterDraft,
     PipelineState,
     ReviewResult,
+    SlideOutline,
     SlideOutlineSet,
     StyleGuide,
 )
@@ -69,6 +75,7 @@ class DocumentStore:
         DocumentParseResult: "document_id",
         Chunk: "chunk_id",
         ChunkSummary: "summary_id",
+        DraftSection: "section_id",
         StyleGuide: "guide_id",
         MasterDraft: "draft_id",
         ReviewResult: "review_id",
@@ -205,6 +212,97 @@ class DocumentStore:
     def load_latest_draft(self) -> MasterDraft | None:
         drafts = self._load_all(MasterDraft, DRAFTS_DIR)
         return max(drafts, key=lambda d: d.version) if drafts else None
+
+    # ------------------------------------------------------------------
+    # Draft sections (incremental saves for Stage 5 resume)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _heading_slug(heading: str) -> str:
+        """Convert a section heading to a safe filename slug."""
+        import re
+
+        slug = heading.lower().strip()
+        slug = re.sub(r"[^\w\s-]", "", slug)
+        slug = re.sub(r"[\s_]+", "_", slug)
+        slug = slug[:80]  # cap length
+        return slug or "section"
+
+    def save_draft_section(self, section: DraftSection) -> Path:
+        """Save a single DraftSection to disk immediately (for resume support)."""
+        DRAFT_SECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        slug = self._heading_slug(section.heading)
+        filename = f"{slug}__{section.section_id[:8]}.json"
+        filepath = DRAFT_SECTIONS_DIR / filename
+        self._atomic_write(section.model_dump_json(indent=2), filepath)
+        logger.debug("Saved draft section '%s' to %s", section.heading, filepath)
+        return filepath
+
+    def load_all_draft_sections(self) -> list[DraftSection]:
+        """Load all incrementally-saved draft sections."""
+        return self._load_all(DraftSection, DRAFT_SECTIONS_DIR)
+
+    def clear_draft_sections(self) -> None:
+        """Delete all incremental draft section files (called after full draft saved)."""
+        if DRAFT_SECTIONS_DIR.exists():
+            for f in DRAFT_SECTIONS_DIR.glob("*.json"):
+                try:
+                    f.unlink()
+                except Exception as exc:
+                    logger.warning("Could not delete draft section file %s: %s", f, exc)
+
+    # ------------------------------------------------------------------
+    # Slide sections (incremental saves for Stage 7 resume)
+    # ------------------------------------------------------------------
+
+    def save_slide_section(self, heading: str, slides: list[SlideOutline]) -> Path:
+        """
+        Save slides for one draft section immediately (for resume support).
+
+        Stores a JSON object with {"heading": ..., "slides": [...]}.
+        """
+        SLIDE_SECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        slug = self._heading_slug(heading)
+        # Use a stable filename per heading so re-runs overwrite safely
+        filename = f"{slug}.json"
+        filepath = SLIDE_SECTIONS_DIR / filename
+        payload = {
+            "heading": heading,
+            "slides": [s.model_dump() for s in slides],
+        }
+        self._atomic_write(json.dumps(payload, indent=2, default=str), filepath)
+        logger.debug("Saved %d slides for section '%s'", len(slides), heading)
+        return filepath
+
+    def load_all_slide_sections(self) -> dict[str, list[SlideOutline]]:
+        """
+        Load all incrementally-saved slide sections.
+
+        Returns a dict of {heading: [SlideOutline, ...]}.
+        """
+        result: dict[str, list[SlideOutline]] = {}
+        if not SLIDE_SECTIONS_DIR.exists():
+            return result
+        for filepath in sorted(SLIDE_SECTIONS_DIR.glob("*.json")):
+            try:
+                payload = json.loads(filepath.read_text(encoding="utf-8"))
+                heading = payload.get("heading", filepath.stem)
+                slides = [
+                    SlideOutline.model_validate(s) for s in payload.get("slides", [])
+                ]
+                result[heading] = slides
+            except Exception as exc:
+                logger.warning("Failed to load slide section %s: %s", filepath, exc)
+        return result
+
+    def clear_slide_sections(self) -> None:
+        """Delete all incremental slide section files (called after full set saved)."""
+        if SLIDE_SECTIONS_DIR.exists():
+            for f in SLIDE_SECTIONS_DIR.glob("*.json"):
+                try:
+                    f.unlink()
+                except Exception as exc:
+                    logger.warning("Could not delete slide section file %s: %s", f, exc)
 
     # ------------------------------------------------------------------
     # Review results

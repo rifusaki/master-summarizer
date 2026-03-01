@@ -663,16 +663,25 @@ class Pipeline:
 
         assert self._central_summarizer is not None
 
+        # Load any sections already persisted from a prior partial run
+        existing_sections = self.store.load_all_draft_sections()
+        if existing_sections:
+            console.print(
+                f"[dim]Resuming synthesis: {len(existing_sections)} sections already "
+                f"completed, skipping those.[/]"
+            )
+
         console.print(
             f"Synthesizing {len(chunk_summaries)} summaries into master draft..."
         )
 
-        # Per-section callback for incremental budget tracking
-        section_count = 0
+        # Per-section callback: save section to disk immediately
+        section_count = len(existing_sections)
 
         async def _on_section_done(section: Any, status: str) -> None:
             nonlocal section_count
             section_count += 1
+            self.store.save_draft_section(section)
             self.budget.set_cumulative_usage(
                 "central_summarization",
                 self._central_summarizer._total_input_tokens,  # type: ignore[union-attr]
@@ -686,6 +695,7 @@ class Pipeline:
         draft = await self._central_summarizer.synthesize(
             chunk_summaries=chunk_summaries,
             style_guide=style_guide,
+            completed_sections=existing_sections,
             on_section_done=_on_section_done,
         )
 
@@ -697,6 +707,8 @@ class Pipeline:
         )
 
         self.store.save_draft(draft)
+        # Full draft saved — discard incremental section files
+        self.store.clear_draft_sections()
 
         # Provenance validation
         prov_result = validate_provenance(draft, chunk_summaries)
@@ -874,12 +886,21 @@ class Pipeline:
 
         assert self._slide_generator is not None
 
+        # Load any slide sections already persisted from a prior partial run
+        existing_slide_sections = self.store.load_all_slide_sections()
+        if existing_slide_sections:
+            console.print(
+                f"[dim]Resuming slide generation: {len(existing_slide_sections)} "
+                f"sections already done, skipping those.[/]"
+            )
+
         console.print("Generating slide outlines...")
 
-        # Per-section callback for incremental tracking
+        # Per-section callback: save slides to disk immediately
         async def _on_section_done(
             slides: list[Any], heading: str, status: str
         ) -> None:
+            self.store.save_slide_section(heading, slides)
             self.budget.set_cumulative_usage(
                 "slide_generation",
                 self._slide_generator._total_input_tokens,  # type: ignore[union-attr]
@@ -891,6 +912,7 @@ class Pipeline:
         outlines = await self._slide_generator.generate_outlines(
             draft=draft,
             style_guide=style_guide,
+            completed_sections=existing_slide_sections,
             on_section_done=_on_section_done,
         )
 
@@ -902,6 +924,8 @@ class Pipeline:
         )
 
         self.store.save_slide_outlines(outlines)
+        # Full outline set saved — discard incremental section files
+        self.store.clear_slide_sections()
 
         # Display slide summary
         console.print(

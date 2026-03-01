@@ -247,8 +247,10 @@ def ensure_output_dirs() -> None:
         CHUNK_SUMMARIES_DIR,
         STYLE_GUIDE_DIR,
         DRAFTS_DIR,
+        DRAFTS_DIR / "sections",  # incremental draft-section saves
         REVIEWS_DIR,
         SLIDES_DIR,
+        SLIDES_DIR / "sections",  # incremental slide-section saves
         REVIEW_DIR,
         CHROMA_DIR,
     ]:

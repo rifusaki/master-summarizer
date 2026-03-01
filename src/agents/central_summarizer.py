@@ -55,6 +55,7 @@ class CentralSummarizerAgent(BaseAgent):
         section_groups: dict[str, list[ChunkSummary]] | None = None,
         version: int = 1,
         *,
+        completed_sections: list[DraftSection] | None = None,
         on_section_done: Callable[[DraftSection, str], Awaitable[None]] | None = None,
     ) -> MasterDraft:
         """
@@ -68,6 +69,8 @@ class CentralSummarizerAgent(BaseAgent):
             style_guide: The inferred style guide to follow.
             section_groups: Optional pre-grouped summaries by section.
             version: Draft version number.
+            completed_sections: Already-synthesized DraftSection objects
+                from a previous partial run. Their headings are skipped.
             on_section_done: Async callback called after each section is
                 synthesized with (section, status). Allows incremental
                 persistence to disk.
@@ -85,6 +88,15 @@ class CentralSummarizerAgent(BaseAgent):
             version,
         )
 
+        # Seed with already-completed sections from a prior partial run
+        sections: list[DraftSection] = list(completed_sections or [])
+        completed_headings: set[str] = {s.heading for s in sections}
+        if completed_headings:
+            logger.info(
+                "Resuming synthesis: %d sections already done, skipping those.",
+                len(completed_headings),
+            )
+
         # Group summaries by section if not provided
         if section_groups is None:
             section_groups = self._group_by_section(chunk_summaries)
@@ -99,10 +111,19 @@ class CentralSummarizerAgent(BaseAgent):
                 section_keys.append(section_title)
 
         # Synthesize each section
-        sections: list[DraftSection] = []
         total_sections = len(section_keys)
 
         for idx, section_title in enumerate(section_keys):
+            # Skip sections already completed in a prior partial run
+            if section_title in completed_headings:
+                logger.info(
+                    "  [%d/%d] Skipping already-completed section: %s",
+                    idx + 1,
+                    total_sections,
+                    section_title,
+                )
+                continue
+
             group = section_groups.get(section_title, [])
             if not group:
                 group = self._fuzzy_match_section(section_title, section_groups)
@@ -150,14 +171,15 @@ class CentralSummarizerAgent(BaseAgent):
         for section in sections:
             used_ids.update(section.source_summary_ids)
         remaining = [s for s in chunk_summaries if s.summary_id not in used_ids]
-        if remaining:
+        appendix_heading = "Información Complementaria"
+        if remaining and appendix_heading not in completed_headings:
             logger.info(
                 "  %d summaries not matched to sections, adding as appendix",
                 len(remaining),
             )
             try:
                 appendix = await self._synthesize_section(
-                    section_title="Información Complementaria",
+                    section_title=appendix_heading,
                     summaries=remaining,
                     style_guide=style_guide,
                 )

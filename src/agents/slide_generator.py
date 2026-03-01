@@ -97,6 +97,7 @@ class SlideGeneratorAgent(BaseAgent):
         draft: MasterDraft,
         style_guide: StyleGuide,
         *,
+        completed_sections: dict[str, list[SlideOutline]] | None = None,
         on_section_done: (
             Callable[[list[SlideOutline], str, str], Awaitable[None]] | None
         ) = None,
@@ -110,6 +111,9 @@ class SlideGeneratorAgent(BaseAgent):
         Args:
             draft: The finalized master draft.
             style_guide: The style guide for formatting rules.
+            completed_sections: Already-generated slides from a prior
+                partial run, keyed by section heading. Those sections
+                are injected directly without calling the LLM again.
             on_section_done: Async callback called after each section
                 with (slides_for_section, section_heading, status).
                 Allows incremental persistence to disk.
@@ -130,13 +134,21 @@ class SlideGeneratorAgent(BaseAgent):
         min_slides = config.target_slide_count_min
         max_slides = config.target_slide_count_max
 
+        # Already-completed sections from a prior partial run
+        done: dict[str, list[SlideOutline]] = dict(completed_sections or {})
+        if done:
+            logger.info(
+                "Resuming slide generation: %d sections already done, skipping those.",
+                len(done),
+            )
+
         # Estimate slides per section based on content volume
         slide_allocations = self._allocate_slides(draft, min_slides, max_slides)
 
         all_slides: list[SlideOutline] = []
         slide_counter = 1
 
-        # Title slide
+        # Title slide (always include; re-number if resuming)
         all_slides.append(
             SlideOutline(
                 slide_number=slide_counter,
@@ -164,11 +176,27 @@ class SlideGeneratorAgent(BaseAgent):
         )
         slide_counter += 1
 
+        # Replay already-completed sections first (in draft order) to keep
+        # slide numbering contiguous before processing new sections.
+        for section in draft.sections:
+            if section.heading in done:
+                prior_slides = done[section.heading]
+                # Re-number from current counter to keep numbering contiguous
+                for i, slide in enumerate(prior_slides):
+                    slide.slide_number = slide_counter + i
+                all_slides.extend(prior_slides)
+                slide_counter += len(prior_slides)
+
         # Process each section
         sections_completed = 0
         total_sections = len(draft.sections)
 
         for section, n_slides in zip(draft.sections, slide_allocations):
+            # Skip sections already done
+            if section.heading in done:
+                sections_completed += 1
+                continue
+
             if n_slides <= 0:
                 sections_completed += 1
                 continue
