@@ -7,8 +7,11 @@ summaries, and other artifacts with JSON metadata sidecars.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import TypeVar
 
@@ -73,8 +76,26 @@ class DocumentStore:
     }
 
     @staticmethod
+    def _atomic_write(content: str, filepath: Path) -> None:
+        """Write content atomically: write to tmp, fsync, rename.
+
+        Prevents partial writes that could corrupt pipeline state on crash.
+        """
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, filepath)
+        except Exception:
+            with contextlib.suppress(Exception):
+                os.unlink(tmp_path)
+            raise
+
+    @staticmethod
     def _save(obj: BaseModel, directory: Path, filename: str | None = None) -> Path:
-        """Save a Pydantic model to a JSON file."""
+        """Save a Pydantic model to a JSON file atomically."""
         # Use object's primary ID field for filename if not specified
         if filename is None:
             id_field = DocumentStore._PRIMARY_ID_FIELD.get(type(obj))
@@ -87,7 +108,7 @@ class DocumentStore:
                 )
 
         filepath = directory / filename
-        filepath.write_text(obj.model_dump_json(indent=2), encoding="utf-8")
+        DocumentStore._atomic_write(obj.model_dump_json(indent=2), filepath)
         logger.debug("Saved %s to %s", type(obj).__name__, filepath)
         return filepath
 
@@ -212,7 +233,7 @@ class DocumentStore:
 
     def save_pipeline_state(self, state: PipelineState) -> Path:
         filepath = STATE_FILE
-        filepath.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+        self._atomic_write(state.model_dump_json(indent=2), filepath)
         logger.info("Pipeline state saved (stage: %s)", state.current_stage)
         return filepath
 

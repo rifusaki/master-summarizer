@@ -30,8 +30,27 @@ class OpenCodeTimeoutError(OpenCodeError):
     """Server or request timed out."""
 
 
-class OpenCodeServerError(OpenCodeError):
-    """Server returned an error response."""
+class OpenCodeRateLimitError(OpenCodeError):
+    """Server returned 429 rate limit response."""
+
+    def __init__(self, message: str = "", retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class OpenCodeHTTPError(OpenCodeError):
+    """Server returned a non-429 HTTP error response."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class OpenCodeServerError(OpenCodeHTTPError):
+    """Legacy alias for backward compatibility."""
+
+    def __init__(self, message: str, status_code: int = 500) -> None:
+        super().__init__(message, status_code=status_code)
 
 
 class OpenCodeClient:
@@ -339,8 +358,19 @@ class OpenCodeClient:
         except httpx.TimeoutException as exc:
             raise OpenCodeTimeoutError(f"Request timed out: {method} {path}") from exc
         except httpx.HTTPStatusError as exc:
-            raise OpenCodeServerError(
-                f"Server error {exc.response.status_code}: {exc.response.text[:500]}"
+            status = exc.response.status_code
+            body = exc.response.text[:500]
+            if status == 429:
+                retry_after: int | None = None
+                try:
+                    retry_after = int(exc.response.headers.get("retry-after", ""))
+                except (ValueError, TypeError):
+                    pass
+                raise OpenCodeRateLimitError(
+                    f"Rate limited (429): {body}", retry_after=retry_after
+                ) from exc
+            raise OpenCodeHTTPError(
+                f"Server error {status}: {body}", status_code=status
             ) from exc
 
     @staticmethod

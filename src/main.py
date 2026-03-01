@@ -11,6 +11,7 @@ escalation.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -34,8 +35,10 @@ from src.config import (
     pipeline_config,
 )
 from src.models import (
+    ArtifactType,
     ChunkSummary,
     DocumentParseResult,
+    ImagePreprocessStatus,
     MasterDraft,
     PipelineStage,
     PipelineState,
@@ -229,11 +232,15 @@ class Pipeline:
 
     async def stage_parse_and_preprocess(self) -> list[DocumentParseResult]:
         """
-        Stage 1: Parse DOCX and PDF files, then preprocess images.
+        Stage 1: Parse DOCX and PDF files, then preprocess images via Gemini.
 
-        - Parse all DOCX files from input/raw_data/
-        - Parse all PDF files from input/style_examples/
-        - Run multimodal preprocessing on images via Gemini
+        Resilient design:
+        - Each document is saved to disk immediately after parsing (before
+          image preprocessing), so a crash never loses parsed text.
+        - Each image description is persisted to disk immediately via the
+          on_image_done callback, so no Gemini tokens are wasted on crash.
+        - On restart, already-saved documents are reloaded from disk and only
+          images that are not yet successfully described are re-processed.
         """
         stage = PipelineStage.PREPROCESSING
 
@@ -244,14 +251,17 @@ class Pipeline:
         self.state.current_stage = stage
         console.print(Panel("Stage 1: Parse & Preprocess", style="bold magenta"))
 
-        # Discover input files
         raw_docs = get_raw_documents()
         style_docs = get_style_examples()
         console.print(f"Found {len(raw_docs)} DOCX files, {len(style_docs)} PDF files")
 
+        # Load any parse results already on disk (from previous partial runs)
+        existing = {r.source_file: r for r in self.store.load_all_parse_results()}
         results: list[DocumentParseResult] = []
 
-        # Parse DOCX files
+        # ----------------------------------------------------------------
+        # Parse DOCX files (skip already saved ones)
+        # ----------------------------------------------------------------
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -261,9 +271,18 @@ class Pipeline:
         ) as progress:
             task = progress.add_task("Parsing DOCX files...", total=len(raw_docs))
             for doc_path in raw_docs:
+                if doc_path.name in existing:
+                    logger.info("Skipping already-parsed DOCX: %s", doc_path.name)
+                    results.append(existing[doc_path.name])
+                    progress.update(
+                        task, advance=1, description=f"Loaded: {doc_path.name[:40]}"
+                    )
+                    continue
                 try:
                     logger.info("Parsing DOCX: %s", doc_path.name)
                     result = parse_docx(doc_path)
+                    # Save immediately so a crash later doesn't lose parse work
+                    self.store.save_parse_result(result)
                     results.append(result)
                     progress.update(
                         task, advance=1, description=f"Parsed: {doc_path.name[:40]}"
@@ -273,7 +292,9 @@ class Pipeline:
                     console.print(f"[red]Failed to parse {doc_path.name}: {exc}[/]")
                     progress.update(task, advance=1)
 
-        # Parse PDF style examples
+        # ----------------------------------------------------------------
+        # Parse PDF style examples (skip already saved ones)
+        # ----------------------------------------------------------------
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -283,9 +304,17 @@ class Pipeline:
         ) as progress:
             task = progress.add_task("Parsing PDF examples...", total=len(style_docs))
             for pdf_path in style_docs:
+                if pdf_path.name in existing:
+                    logger.info("Skipping already-parsed PDF: %s", pdf_path.name)
+                    results.append(existing[pdf_path.name])
+                    progress.update(
+                        task, advance=1, description=f"Loaded: {pdf_path.name[:40]}"
+                    )
+                    continue
                 try:
                     logger.info("Parsing PDF: %s", pdf_path.name)
                     result = parse_pdf(pdf_path)
+                    self.store.save_parse_result(result)
                     results.append(result)
                     progress.update(
                         task, advance=1, description=f"Parsed: {pdf_path.name[:40]}"
@@ -295,35 +324,57 @@ class Pipeline:
                     console.print(f"[red]Failed to parse {pdf_path.name}: {exc}[/]")
                     progress.update(task, advance=1)
 
-        # Preprocess images through Gemini
+        # ----------------------------------------------------------------
+        # Preprocess images — only those not yet successfully described
+        # ----------------------------------------------------------------
         assert self._preprocessor is not None
-        total_images = sum(
+
+        pending_images = sum(
             1
             for r in results
             for a in r.artifacts
-            if a.artifact_type.value == "image" and a.image_base64
+            if a.artifact_type == ArtifactType.IMAGE
+            and a.image_base64
+            and a.metadata.get("preprocess_status") != ImagePreprocessStatus.SUCCESS
         )
 
-        if total_images > 0:
-            console.print(f"Preprocessing {total_images} images via Gemini...")
+        if pending_images > 0:
+            console.print(
+                f"Preprocessing {pending_images} images via Gemini "
+                f"(fresh session per image to prevent context bloat)..."
+            )
+            run_id = self.state.active_run_id
+
             for result in results:
-                result = await self._preprocessor.process_document(result)
-                # Track budget
-                self.budget.record_usage(
-                    "preprocessing",
-                    self._preprocessor._total_input_tokens,
-                    self._preprocessor._total_output_tokens,
+                needs_preprocess = any(
+                    a.artifact_type == ArtifactType.IMAGE
+                    and a.image_base64
+                    and a.metadata.get("preprocess_status")
+                    != ImagePreprocessStatus.SUCCESS
+                    for a in result.artifacts
+                )
+                if not needs_preprocess:
+                    continue
+
+                async def _save_callback(r: DocumentParseResult) -> None:
+                    self.store.save_parse_result(r)
+                    self.budget.record_usage(
+                        "preprocessing",
+                        self._preprocessor._total_input_tokens,  # type: ignore[union-attr]
+                        self._preprocessor._total_output_tokens,  # type: ignore[union-attr]
+                    )
+                    # Also persist pipeline state so we can see progress
+                    self._save_checkpoint()
+
+                await self._preprocessor.process_document(
+                    result,
+                    run_id=run_id,
+                    on_image_done=_save_callback,
                 )
         else:
-            console.print("[dim]No images to preprocess[/]")
+            console.print("[dim]All images already preprocessed.[/]")
 
-        # Save all results
-        for result in results:
-            self.store.save_parse_result(result)
-
-        # Display summary
         self._display_parse_summary(results)
-
         self.state.total_documents = len(results)
         self._mark_stage_complete(stage)
 
@@ -397,7 +448,18 @@ class Pipeline:
         console.print(Panel("Stage 3: Chunk Summarization", style="bold magenta"))
 
         assert self._chunk_summarizer is not None
-        all_summaries: list[ChunkSummary] = []
+
+        # Load already-completed summaries so we can resume mid-stage
+        existing_summaries = self.store.load_all_chunk_summaries()
+        completed_chunk_ids = {s.chunk_id for s in existing_summaries}
+        if completed_chunk_ids:
+            console.print(
+                f"[dim]Resuming: {len(completed_chunk_ids)} chunks already summarized, "
+                f"skipping those.[/]"
+            )
+
+        pending_chunks = [c for c in chunks if c.chunk_id not in completed_chunk_ids]
+        all_summaries: list[ChunkSummary] = list(existing_summaries)
         batch_size = pipeline_config.chunk_summary_batch_size
 
         with Progress(
@@ -407,11 +469,11 @@ class Pipeline:
             TextColumn("{task.completed}/{task.total}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Summarizing chunks...", total=len(chunks))
+            task = progress.add_task("Summarizing chunks...", total=len(pending_chunks))
 
             # Process in batches
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i : i + batch_size]
+            for i in range(0, len(pending_chunks), batch_size):
+                batch = pending_chunks[i : i + batch_size]
                 summaries = await self._chunk_summarizer.summarize_chunks(batch)
                 all_summaries.extend(summaries)
                 self.store.save_chunk_summaries(summaries)
@@ -422,6 +484,9 @@ class Pipeline:
                     self._chunk_summarizer._total_input_tokens,
                     self._chunk_summarizer._total_output_tokens,
                 )
+
+                # Persist pipeline state mid-stage
+                self._save_checkpoint()
 
                 progress.update(
                     task,
@@ -970,9 +1035,8 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """CLI entry point for the summarization pipeline."""
-    # Configure logging
+def _configure_logging() -> None:
+    """Set up rich logging for the pipeline."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -985,10 +1049,170 @@ def main() -> None:
             )
         ],
     )
-    # Suppress noisy loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("chromadb").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _is_failed_image(artifact: Any) -> bool:
+    """
+    Return True if an image artifact needs (re-)preprocessing.
+
+    Primary check: preprocess_status metadata stamped by the new code.
+    Legacy fallback: no content_type in metadata means it was never described
+    (prior-run artifacts before status tracking was added).
+    """
+    status = artifact.metadata.get("preprocess_status")
+    if status == ImagePreprocessStatus.SUCCESS:
+        return False
+    if status and status.startswith("failed_"):
+        return True
+    # Legacy heuristic: image artifact with no description yet
+    if artifact.artifact_type == ArtifactType.IMAGE and not artifact.metadata.get(
+        "content_type"
+    ):
+        return True
+    # Low confidence with no status = likely a silent failure from old code
+    if artifact.confidence <= 0.3 and not status:
+        return True
+    return False
+
+
+async def _retry_failed_images_async(all_runs: bool = False) -> None:
+    """
+    Async impl of --retry-failed-images mode.
+
+    Loads all saved parse results, identifies failed/unprocessed image artifacts,
+    and runs preprocessing only on those using the current model config (with
+    fallback support). Persists results after each image.
+    """
+    from src.config import PREPROCESSED_DIR
+    from src.storage.vector_store import VectorStore
+
+    console.print(
+        Panel(
+            "[bold]Retry Failed Images Mode[/]\n"
+            "Reprocessing only failed/pending image descriptions.",
+            style="bold yellow",
+        )
+    )
+
+    store = DocumentStore()
+    client = OpenCodeClient()
+    await client.start()
+    preprocessor = PreprocessorAgent(client)
+
+    try:
+        results = store.load_all_parse_results()
+        if not results:
+            console.print(
+                "[red]No parse results found in output/preprocessed/. "
+                "Run the full pipeline first.[/]"
+            )
+            return
+
+        total_failed = sum(
+            1
+            for r in results
+            for a in r.artifacts
+            if a.image_base64 and _is_failed_image(a)
+        )
+
+        if total_failed == 0:
+            console.print("[green]No failed images found. Nothing to retry.[/]")
+            return
+
+        console.print(
+            f"Found [bold]{total_failed}[/] failed/pending images across "
+            f"{len(results)} documents."
+        )
+
+        recovered = 0
+        still_failed = 0
+
+        for result in results:
+            failed_ids = {
+                a.artifact_id
+                for a in result.artifacts
+                if a.image_base64 and _is_failed_image(a)
+            }
+            if not failed_ids:
+                continue
+
+            logger.info("Retrying %d images in %s", len(failed_ids), result.source_file)
+
+            before_success = sum(
+                1
+                for a in result.artifacts
+                if a.metadata.get("preprocess_status") == ImagePreprocessStatus.SUCCESS
+            )
+
+            async def _save(r: DocumentParseResult) -> None:
+                store.save_parse_result(r)
+
+            await preprocessor.process_document(
+                result,
+                target_artifact_ids=failed_ids,
+                on_image_done=_save,
+            )
+
+            after_success = sum(
+                1
+                for a in result.artifacts
+                if a.metadata.get("preprocess_status") == ImagePreprocessStatus.SUCCESS
+            )
+            doc_recovered = after_success - before_success
+            doc_still_failed = len(failed_ids) - doc_recovered
+            recovered += doc_recovered
+            still_failed += doc_still_failed
+
+            logger.info(
+                "%s: recovered=%d, still_failed=%d",
+                result.source_file,
+                doc_recovered,
+                doc_still_failed,
+            )
+
+        console.print(
+            Panel(
+                f"Retry complete.\n"
+                f"  Recovered: [bold green]{recovered}[/]\n"
+                f"  Still failed: [bold red]{still_failed}[/]\n"
+                f"  Total token cost: "
+                f"input={preprocessor._total_input_tokens:,}, "
+                f"output={preprocessor._total_output_tokens:,}",
+                title="Retry Summary",
+                style="cyan",
+            )
+        )
+
+    finally:
+        await client.stop()
+
+
+def main() -> None:
+    """CLI entry point for the summarization pipeline."""
+    parser = argparse.ArgumentParser(
+        prog="summarizer",
+        description="Master Summarizer — multi-agent POT document pipeline",
+    )
+    parser.add_argument(
+        "--retry-failed-images",
+        action="store_true",
+        help=(
+            "Retry only failed/pending image descriptions using saved parse results. "
+            "Does not re-run parsing or other pipeline stages."
+        ),
+    )
+    parser.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="With --retry-failed-images: include images failed in any prior run, "
+        "not just the most recent one.",
+    )
+    args = parser.parse_args()
+
+    _configure_logging()
 
     console.print(
         Panel(
@@ -998,6 +1222,10 @@ def main() -> None:
             style="bold blue",
         )
     )
+
+    if args.retry_failed_images:
+        asyncio.run(_retry_failed_images_async(all_runs=args.all_runs))
+        return
 
     pipeline = Pipeline()
     asyncio.run(pipeline.run())

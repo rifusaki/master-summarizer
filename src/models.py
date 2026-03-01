@@ -372,13 +372,29 @@ class PipelineTask(BaseModel):
     retry_count: int = 0
 
 
+class ImagePreprocessStatus:
+    """Status constants for per-image preprocessing tracking in artifact metadata."""
+
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED_TIMEOUT = "failed_timeout"
+    FAILED_RATE_LIMIT = "failed_rate_limit"
+    FAILED_OTHER = "failed_other"
+
+
 class PipelineState(BaseModel):
     """Overall state of the pipeline for checkpointing and resume."""
 
     state_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    # Unique ID for this run; stamped on each artifact so failed-only retry
+    # can scope itself to the current run or all runs.
+    active_run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     current_stage: PipelineStage = PipelineStage.PREPROCESSING
     stages_completed: list[PipelineStage] = Field(default_factory=list)
     tasks: list[PipelineTask] = Field(default_factory=list)
+    # Fine-grained progress within each stage (used for mid-stage resume).
+    # Keys are stage names; values are stage-specific progress dicts.
+    stage_progress: dict[str, Any] = Field(default_factory=dict)
     # Aggregate stats
     total_tokens_used: int = 0
     total_cost_usd: float = 0.0

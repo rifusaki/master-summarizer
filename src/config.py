@@ -80,9 +80,9 @@ MODELS: dict[str, ModelConfig] = {
         cost_output_per_m=12.0,
     ),
     "chunk_summarization": ModelConfig(
-        provider_id="github-copilot",
-        model_id="claude-sonnet-4.6",
-        context_window=128_000,
+        provider_id="azure-anthropic",
+        model_id="claude-sonnet-4-6",
+        context_window=200_000,
         max_output=64_000,
         supports_images=True,
     ),
@@ -112,6 +112,37 @@ MODELS: dict[str, ModelConfig] = {
         context_window=200_000,
         max_output=100_000,
     ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Fallback model chains (tried in order when primary model fails)
+# ---------------------------------------------------------------------------
+
+# NOTE: gemini-3-pro model id must be validated against your OpenCode instance.
+# Run: opencode models | grep gemini  to find the exact identifier.
+FALLBACK_MODELS: dict[str, list[ModelConfig]] = {
+    "preprocessing": [
+        ModelConfig(
+            provider_id="google",
+            model_id="gemini-3-pro",  # validate exact id in your OpenCode instance
+            context_window=1_048_576,
+            max_output=65_536,
+            supports_images=True,
+            supports_pdf=True,
+            cost_input_per_m=1.0,
+            cost_output_per_m=6.0,
+        ),
+    ],
+    "chunk_summarization": [
+        ModelConfig(
+            provider_id="azure-anthropic",
+            model_id="claude-sonnet-4-5",
+            context_window=200_000,
+            max_output=64_000,
+            supports_images=True,
+        ),
+    ],
 }
 
 
@@ -157,6 +188,28 @@ class PipelineConfig:
     # Timeouts (seconds)
     llm_timeout: int = 300  # 5 minutes per LLM call
     server_startup_timeout: int = 30
+
+    # Preprocessing resilience
+    # How many consecutive 429s before prompting user to switch to fallback model
+    preprocessing_rate_limit_streak_threshold: int = field(
+        default_factory=lambda: int(
+            os.getenv("PREPROCESSING_RATE_LIMIT_STREAK_THRESHOLD", "3")
+        )
+    )
+    # Retries per image on timeout (each retry uses a fresh session)
+    preprocessing_timeout_retries: int = field(
+        default_factory=lambda: int(os.getenv("PREPROCESSING_TIMEOUT_RETRIES", "1"))
+    )
+    # Ask user before switching to fallback Gemini model (set to 0 to auto-switch)
+    preprocessing_confirm_fallback: bool = field(
+        default_factory=lambda: os.getenv("PREPROCESSING_CONFIRM_FALLBACK", "1") != "0"
+    )
+
+    # Chunk summarization resilience
+    # Retries using fallback model before accepting failure
+    chunk_summary_fallback_retries: int = field(
+        default_factory=lambda: int(os.getenv("CHUNK_SUMMARY_FALLBACK_RETRIES", "1"))
+    )
 
     @property
     def opencode_base_url(self) -> str:
