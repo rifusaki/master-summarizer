@@ -119,6 +119,15 @@ class PreprocessorAgent(BaseAgent):
         self._fallback_confirmed: bool = False  # user said yes to fallback
         self._exhausted: bool = False  # all models exhausted, stop processing
 
+    def set_active_model(self, model: ModelConfig) -> None:
+        """Override the active model (e.g. from a --preprocess-model CLI flag)."""
+        logger.info(
+            "Preprocessor active model overridden: %s -> %s",
+            self._active_model.full_id,
+            model.full_id,
+        )
+        self._active_model = model
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

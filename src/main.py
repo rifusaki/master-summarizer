@@ -941,24 +941,28 @@ class Pipeline:
     # Full pipeline execution
     # ------------------------------------------------------------------
 
-    async def run(self) -> None:
-        """
-        Execute the full pipeline with checkpoints between stages.
-
-        Stages:
-        1. Parse & Preprocess
-        2. Chunk
-        3. Summarize Chunks
-        4. Learn Style
-        5. Central Synthesis
-        6. Review & Refinement
-        7. Slide Generation
-
-        If a ModelExhaustionError occurs at any stage, the pipeline
-        saves all progress and stops cleanly.
-        """
+    async def run(self, preprocess_model: str | None = None) -> None:
+        """Run the full pipeline."""
         try:
             await self.startup()
+            if preprocess_model and self._preprocessor:
+                from src.config import MODELS, ModelConfig
+
+                # Build a ModelConfig from the full_id string "provider/model"
+                parts = preprocess_model.split("/", 1)
+                if len(parts) == 2:
+                    override = ModelConfig(
+                        provider_id=parts[0],
+                        model_id=parts[1],
+                        context_window=1_048_576,
+                        max_output=65_536,
+                        supports_images=True,
+                        supports_pdf=True,
+                    )
+                    self._preprocessor.set_active_model(override)
+                    console.print(
+                        f"[yellow]Preprocessing model overridden: {preprocess_model}[/]"
+                    )
 
             # Stage 1: Parse & Preprocess
             parse_results = await self.stage_parse_and_preprocess()
@@ -1432,6 +1436,15 @@ def main() -> None:
         help="With --retry-failed-images: include images failed in any prior run, "
         "not just the most recent one.",
     )
+    parser.add_argument(
+        "--preprocess-model",
+        metavar="PROVIDER/MODEL",
+        default=None,
+        help=(
+            "Override the preprocessing model for this run only. "
+            "Example: --preprocess-model google/gemini-3-pro-preview"
+        ),
+    )
     args = parser.parse_args()
 
     _configure_logging()
@@ -1454,7 +1467,7 @@ def main() -> None:
         return
 
     pipeline = Pipeline()
-    asyncio.run(pipeline.run())
+    asyncio.run(pipeline.run(preprocess_model=args.preprocess_model))
 
 
 if __name__ == "__main__":
