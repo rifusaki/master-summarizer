@@ -1,19 +1,29 @@
 """
-Chunk summarization agent (Claude Sonnet 4.6).
+Chunk summarization agent (Claude Sonnet 4.6, with fallback).
 
 Produces faithful, length-limited summaries of individual chunks
 while preserving numeric values, key facts, and provenance links.
+
+Resilience design:
+- Uses call_llm_structured_resilient for automatic retry + fallback.
+- Per-chunk status tracking so failed chunks can be retried without
+  re-processing successful ones.
+- Raises ModelExhaustionError when all models in the fallback chain
+  are exhausted, after saving all progress completed so far.
+- on_chunk_done callback for incremental persistence.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from src.agents.base import BaseAgent
+from src.agents.base import BaseAgent, ModelExhaustionError
 from src.models import (
     Chunk,
     ChunkSummary,
+    ItemStatus,
     KeyFact,
     NumericEntry,
     PipelineStage,
@@ -90,33 +100,66 @@ CHUNK_SUMMARY_SCHEMA: dict[str, Any] = {
 
 class ChunkSummarizerAgent(BaseAgent):
     """
-    Chunk summarization agent using Claude Sonnet 4.6.
+    Chunk summarization agent using Claude Sonnet 4.6 (with fallback).
 
     Produces faithful, structured summaries for each chunk while
     preserving numeric data, key facts, and flagging uncertainties.
+
+    Resilient features:
+    - Automatic retry with fallback model chain via call_llm_structured_resilient.
+    - Per-chunk status tracking (success/failed) for resume support.
+    - Raises ModelExhaustionError when all models are exhausted.
+    - on_chunk_done callback for per-chunk incremental saves.
     """
 
     role = "chunk_summarization"
     stage = PipelineStage.CHUNK_SUMMARIZATION
 
-    async def summarize_chunk(self, chunk: Chunk) -> ChunkSummary:
+    async def summarize_chunk(self, chunk: Chunk) -> tuple[ChunkSummary, str]:
         """
-        Summarize a single chunk.
+        Summarize a single chunk with retry/fallback.
 
-        Returns a ChunkSummary with structured data and provenance.
+        Returns:
+            Tuple of (ChunkSummary, status_string).
+            status_string is ItemStatus.SUCCESS or an ItemStatus.FAILED_* value.
+
+        Raises:
+            ModelExhaustionError: When all models in the chain are exhausted.
         """
         user_prompt = self._build_prompt(chunk)
 
-        result = await self.call_llm_structured(
+        result, model_used = await self.call_llm_structured_resilient(
             user_prompt=user_prompt,
             schema=CHUNK_SUMMARY_SCHEMA,
+            item_id=chunk.chunk_id[:12],
         )
 
-        summary = self._parse_result(result, chunk)
-        return summary
+        summary = self._parse_result(result, chunk, model_used)
+        return summary, ItemStatus.SUCCESS
 
-    async def summarize_chunks(self, chunks: list[Chunk]) -> list[ChunkSummary]:
-        """Summarize multiple chunks sequentially."""
+    async def summarize_chunks(
+        self,
+        chunks: list[Chunk],
+        *,
+        on_chunk_done: Callable[[ChunkSummary, str], Awaitable[None]] | None = None,
+    ) -> list[ChunkSummary]:
+        """
+        Summarize multiple chunks sequentially with resilience.
+
+        Args:
+            chunks: List of chunks to summarize.
+            on_chunk_done: Async callback called after each chunk attempt
+                with (summary, status). The caller can persist the summary
+                to disk immediately.
+
+        Returns:
+            List of ChunkSummary objects for all successfully summarized
+            chunks (and fallback summaries for non-exhaustion failures).
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted. All progress
+                up to this point has already been saved via on_chunk_done.
+        """
         summaries: list[ChunkSummary] = []
 
         for idx, chunk in enumerate(chunks):
@@ -128,7 +171,7 @@ class ChunkSummarizerAgent(BaseAgent):
                 chunk.token_count,
             )
             try:
-                summary = await self.summarize_chunk(chunk)
+                summary, status = await self.summarize_chunk(chunk)
                 summaries.append(summary)
                 logger.info(
                     "  -> confidence: %.2f, %d key facts, %d numeric entries",
@@ -136,6 +179,27 @@ class ChunkSummarizerAgent(BaseAgent):
                     len(summary.key_facts),
                     len(summary.numeric_table),
                 )
+
+                if on_chunk_done is not None:
+                    try:
+                        await on_chunk_done(summary, status)
+                    except Exception as cb_exc:
+                        logger.warning("on_chunk_done callback failed: %s", cb_exc)
+
+            except ModelExhaustionError as exc:
+                # Update remaining count and re-raise
+                exc.items_completed = len(summaries)
+                exc.items_remaining = len(chunks) - idx
+                logger.error(
+                    "Model exhaustion at chunk %d/%d. "
+                    "%d summaries completed, %d remaining.",
+                    idx + 1,
+                    len(chunks),
+                    exc.items_completed,
+                    exc.items_remaining,
+                )
+                raise
+
             except Exception as exc:
                 logger.error(
                     "  -> Failed to summarize chunk %s: %s",
@@ -157,6 +221,13 @@ class ChunkSummarizerAgent(BaseAgent):
                     ),
                 )
                 summaries.append(fallback)
+                status = ItemStatus.FAILED_OTHER
+
+                if on_chunk_done is not None:
+                    try:
+                        await on_chunk_done(fallback, status)
+                    except Exception as cb_exc:
+                        logger.warning("on_chunk_done callback failed: %s", cb_exc)
 
         return summaries
 
@@ -188,7 +259,9 @@ class ChunkSummarizerAgent(BaseAgent):
 
 {chunk.content}"""
 
-    def _parse_result(self, result: dict[str, Any], chunk: Chunk) -> ChunkSummary:
+    def _parse_result(
+        self, result: dict[str, Any], chunk: Chunk, model_used: str = ""
+    ) -> ChunkSummary:
         """Parse the structured LLM output into a ChunkSummary model."""
         key_facts = [
             KeyFact(
@@ -211,6 +284,14 @@ class ChunkSummarizerAgent(BaseAgent):
             for ne in result.get("numeric_table", [])
         ]
 
+        provenance = self.create_provenance(
+            chunk_ids=[chunk.chunk_id],
+            original_excerpt=chunk.content[:500],
+        )
+        # Record actual model used (may differ from primary if fallback was used)
+        if model_used:
+            provenance.model = model_used
+
         return ChunkSummary(
             chunk_id=chunk.chunk_id,
             document_id=chunk.document_id,
@@ -223,8 +304,5 @@ class ChunkSummarizerAgent(BaseAgent):
             section_title=chunk.section_title,
             heading_path=chunk.heading_path,
             sequence_index=chunk.sequence_index,
-            provenance=self.create_provenance(
-                chunk_ids=[chunk.chunk_id],
-                original_excerpt=chunk.content[:500],
-            ),
+            provenance=provenance,
         )

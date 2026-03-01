@@ -1,17 +1,26 @@
 """
-Slide outline generation agent (GPT-5.3 Codex).
+Slide outline generation agent (GPT-5.3 Codex, with fallback).
 
 Converts the final master draft into structured slide-by-slide
 outlines with titles, bullets, visual suggestions, and source refs.
+
+Resilience design:
+- Uses call_llm_structured_resilient for retry + fallback.
+- Per-section incremental saves via on_section_done callback.
+- Raises ModelExhaustionError when all models are exhausted,
+  after saving all progress completed so far.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from src.agents.base import BaseAgent
+from src.agents.base import BaseAgent, ModelExhaustionError
 from src.models import (
+    DraftSection,
+    ItemStatus,
     MasterDraft,
     PipelineStage,
     SlideOutline,
@@ -69,10 +78,15 @@ SLIDE_OUTLINE_SCHEMA: dict[str, Any] = {
 
 class SlideGeneratorAgent(BaseAgent):
     """
-    Slide outline generator using GPT-5.3 Codex.
+    Slide outline generator using GPT-5.3 Codex (with fallback).
 
     Converts the final master draft into a structured set of
     80-100 slide outlines ready for PowerPoint creation.
+
+    Resilient features:
+    - Automatic retry with fallback model chain via call_llm_structured_resilient.
+    - Per-section incremental saves via on_section_done callback.
+    - Raises ModelExhaustionError when all models are exhausted.
     """
 
     role = "slide_generation"
@@ -82,12 +96,29 @@ class SlideGeneratorAgent(BaseAgent):
         self,
         draft: MasterDraft,
         style_guide: StyleGuide,
+        *,
+        on_section_done: (
+            Callable[[list[SlideOutline], str, str], Awaitable[None]] | None
+        ) = None,
     ) -> SlideOutlineSet:
         """
         Generate slide outlines from the master draft.
 
         Processes the draft section by section to stay within
         context limits, then assembles the full outline set.
+
+        Args:
+            draft: The finalized master draft.
+            style_guide: The style guide for formatting rules.
+            on_section_done: Async callback called after each section
+                with (slides_for_section, section_heading, status).
+                Allows incremental persistence to disk.
+
+        Returns:
+            Complete SlideOutlineSet.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         logger.info(
             "Generating slide outlines from draft v%d (%d sections)",
@@ -100,7 +131,6 @@ class SlideGeneratorAgent(BaseAgent):
         max_slides = config.target_slide_count_max
 
         # Estimate slides per section based on content volume
-        total_words = draft.total_word_count or 1
         slide_allocations = self._allocate_slides(draft, min_slides, max_slides)
 
         all_slides: list[SlideOutline] = []
@@ -135,26 +165,56 @@ class SlideGeneratorAgent(BaseAgent):
         slide_counter += 1
 
         # Process each section
+        sections_completed = 0
+        total_sections = len(draft.sections)
+
         for section, n_slides in zip(draft.sections, slide_allocations):
             if n_slides <= 0:
+                sections_completed += 1
                 continue
 
             logger.info(
-                "  Section '%s': %d slides allocated",
+                "  Section %d/%d '%s': %d slides allocated",
+                sections_completed + 1,
+                total_sections,
                 section.heading[:40],
                 n_slides,
             )
 
-            section_slides = await self._generate_section_slides(
-                section_heading=section.heading,
-                section_content=section.content,
-                style_guide=style_guide,
-                n_slides=n_slides,
-                start_number=slide_counter,
-            )
+            try:
+                section_slides = await self._generate_section_slides(
+                    section_heading=section.heading,
+                    section_content=section.content,
+                    style_guide=style_guide,
+                    n_slides=n_slides,
+                    start_number=slide_counter,
+                )
 
-            all_slides.extend(section_slides)
-            slide_counter += len(section_slides)
+                all_slides.extend(section_slides)
+                slide_counter += len(section_slides)
+                sections_completed += 1
+
+                if on_section_done is not None:
+                    try:
+                        await on_section_done(
+                            section_slides, section.heading, ItemStatus.SUCCESS
+                        )
+                    except Exception as cb_exc:
+                        logger.warning("on_section_done callback failed: %s", cb_exc)
+
+            except ModelExhaustionError as exc:
+                exc.items_completed = sections_completed
+                exc.items_remaining = total_sections - sections_completed
+                logger.error(
+                    "Model exhaustion at section %d/%d (%s). "
+                    "%d sections completed, %d remaining.",
+                    sections_completed + 1,
+                    total_sections,
+                    section.heading[:40],
+                    exc.items_completed,
+                    exc.items_remaining,
+                )
+                raise
 
         outline_set = SlideOutlineSet(
             slides=all_slides,
@@ -180,7 +240,14 @@ class SlideGeneratorAgent(BaseAgent):
         n_slides: int,
         start_number: int,
     ) -> list[SlideOutline]:
-        """Generate slides for a single section."""
+        """
+        Generate slides for a single section.
+
+        Uses call_llm_structured_resilient for retry/fallback.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
+        """
         user_prompt = f"""# Slide Generation Task
 
 Convert the following section into exactly {n_slides} PowerPoint slide outlines.
@@ -204,9 +271,10 @@ Target Reader: {style_guide.target_reader}
 
 Generate {n_slides} slides for this section."""
 
-        result = await self.call_llm_structured(
+        result, model_used = await self.call_llm_structured_resilient(
             user_prompt=user_prompt,
             schema=SLIDE_OUTLINE_SCHEMA,
+            item_id=f"slides:{section_heading[:30]}",
         )
 
         slides = []
@@ -229,6 +297,12 @@ Generate {n_slides} slides for this section."""
                     ),
                 )
             )
+
+        logger.info(
+            "  -> %d slides generated (model: %s)",
+            len(slides),
+            model_used,
+        )
 
         return slides
 

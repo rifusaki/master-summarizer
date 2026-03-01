@@ -132,6 +132,8 @@ class BudgetTracker:
     cost_cap_usd: float | None = None
     # Optional per-role call limits
     call_limits: dict[str, int] = field(default_factory=dict)
+    # Last-seen cumulative values per role (for set_usage delta computation)
+    _last_seen: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     def record_usage(
         self,
@@ -139,7 +141,13 @@ class BudgetTracker:
         input_tokens: int,
         output_tokens: int,
     ) -> None:
-        """Record token usage for a role."""
+        """
+        Record a delta of token usage for a role.
+
+        Use this when you already know the delta (e.g. from a single
+        LLM call response).  For cumulative agent totals, use
+        ``set_cumulative_usage()`` instead.
+        """
         if role not in self.usage:
             model = MODELS.get(role)
             self.usage[role] = RoleUsage(
@@ -158,6 +166,36 @@ class BudgetTracker:
             entry.cost_usd = estimate_cost(
                 entry.input_tokens, entry.output_tokens, model
             )
+
+    def set_cumulative_usage(
+        self,
+        role: str,
+        cumulative_input: int,
+        cumulative_output: int,
+    ) -> None:
+        """
+        Update usage from cumulative agent token counters.
+
+        Agents track ``_total_input_tokens`` / ``_total_output_tokens``
+        as running totals.  Passing those values here computes the
+        delta since the last call and records only the *new* tokens.
+        This avoids the double-counting bug that occurs when additive
+        ``record_usage`` is called with cumulative values.
+        """
+        prev_in, prev_out = self._last_seen.get(role, (0, 0))
+        delta_in = cumulative_input - prev_in
+        delta_out = cumulative_output - prev_out
+
+        # Guard against negative deltas (e.g. agent replaced mid-run)
+        if delta_in < 0:
+            delta_in = cumulative_input
+        if delta_out < 0:
+            delta_out = cumulative_output
+
+        self._last_seen[role] = (cumulative_input, cumulative_output)
+
+        if delta_in > 0 or delta_out > 0:
+            self.record_usage(role, delta_in, delta_out)
 
     def check_budget(self, role: str | None = None) -> bool:
         """

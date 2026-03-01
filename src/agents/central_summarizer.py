@@ -1,20 +1,28 @@
 """
-Central summarization agent (Claude Opus 4.6).
+Central summarization agent (Claude Opus 4.6, with fallback).
 
 Synthesizes all chunk summaries into a coherent master draft,
 following the inferred style guide and targeting the structure
 needed for an 80-100 slide presentation.
+
+Resilience design:
+- Uses call_llm_resilient for automatic retry + fallback.
+- Per-section incremental saves via on_section_done callback.
+- Raises ModelExhaustionError when all models are exhausted,
+  after saving all progress completed so far.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from src.agents.base import BaseAgent
+from src.agents.base import BaseAgent, ModelExhaustionError
 from src.models import (
     ChunkSummary,
     DraftSection,
+    ItemStatus,
     MasterDraft,
     PipelineStage,
     ReviewResult,
@@ -26,10 +34,15 @@ logger = logging.getLogger(__name__)
 
 class CentralSummarizerAgent(BaseAgent):
     """
-    Central summarization agent using Claude Opus 4.6.
+    Central summarization agent using Claude Opus 4.6 (with fallback).
 
     Synthesizes chunk summaries into a master draft organized
     according to the style guide, with provenance linking.
+
+    Resilient features:
+    - Automatic retry with fallback model chain via call_llm_resilient.
+    - Per-section incremental saves via on_section_done callback.
+    - Raises ModelExhaustionError when all models are exhausted.
     """
 
     role = "central_summarization"
@@ -41,6 +54,8 @@ class CentralSummarizerAgent(BaseAgent):
         style_guide: StyleGuide,
         section_groups: dict[str, list[ChunkSummary]] | None = None,
         version: int = 1,
+        *,
+        on_section_done: Callable[[DraftSection, str], Awaitable[None]] | None = None,
     ) -> MasterDraft:
         """
         Synthesize chunk summaries into a master draft.
@@ -53,9 +68,16 @@ class CentralSummarizerAgent(BaseAgent):
             style_guide: The inferred style guide to follow.
             section_groups: Optional pre-grouped summaries by section.
             version: Draft version number.
+            on_section_done: Async callback called after each section is
+                synthesized with (section, status). Allows incremental
+                persistence to disk.
 
         Returns:
             Complete MasterDraft with sections and provenance.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted. All
+                progress has been saved via on_section_done.
         """
         logger.info(
             "Starting central synthesis: %d summaries, version %d",
@@ -67,27 +89,61 @@ class CentralSummarizerAgent(BaseAgent):
         if section_groups is None:
             section_groups = self._group_by_section(chunk_summaries)
 
-        # Synthesize each section
-        sections: list[DraftSection] = []
+        # Build the list of sections to synthesize
+        section_keys: list[str] = []
         for section_title in style_guide.section_order or list(section_groups.keys()):
             group = section_groups.get(section_title, [])
             if not group:
-                # Try fuzzy matching
+                group = self._fuzzy_match_section(section_title, section_groups)
+            if group:
+                section_keys.append(section_title)
+
+        # Synthesize each section
+        sections: list[DraftSection] = []
+        total_sections = len(section_keys)
+
+        for idx, section_title in enumerate(section_keys):
+            group = section_groups.get(section_title, [])
+            if not group:
                 group = self._fuzzy_match_section(section_title, section_groups)
             if not group:
                 continue
 
             logger.info(
-                "  Synthesizing section: %s (%d summaries)",
+                "  Synthesizing section %d/%d: %s (%d summaries)",
+                idx + 1,
+                total_sections,
                 section_title,
                 len(group),
             )
-            section = await self._synthesize_section(
-                section_title=section_title,
-                summaries=group,
-                style_guide=style_guide,
-            )
-            sections.append(section)
+
+            try:
+                section = await self._synthesize_section(
+                    section_title=section_title,
+                    summaries=group,
+                    style_guide=style_guide,
+                )
+                sections.append(section)
+
+                if on_section_done is not None:
+                    try:
+                        await on_section_done(section, ItemStatus.SUCCESS)
+                    except Exception as cb_exc:
+                        logger.warning("on_section_done callback failed: %s", cb_exc)
+
+            except ModelExhaustionError as exc:
+                exc.items_completed = len(sections)
+                exc.items_remaining = total_sections - idx
+                logger.error(
+                    "Model exhaustion at section %d/%d (%s). "
+                    "%d sections completed, %d remaining.",
+                    idx + 1,
+                    total_sections,
+                    section_title,
+                    exc.items_completed,
+                    exc.items_remaining,
+                )
+                raise
 
         # Handle any remaining ungrouped summaries
         used_ids = set()
@@ -99,12 +155,26 @@ class CentralSummarizerAgent(BaseAgent):
                 "  %d summaries not matched to sections, adding as appendix",
                 len(remaining),
             )
-            appendix = await self._synthesize_section(
-                section_title="Información Complementaria",
-                summaries=remaining,
-                style_guide=style_guide,
-            )
-            sections.append(appendix)
+            try:
+                appendix = await self._synthesize_section(
+                    section_title="Información Complementaria",
+                    summaries=remaining,
+                    style_guide=style_guide,
+                )
+                sections.append(appendix)
+
+                if on_section_done is not None:
+                    try:
+                        await on_section_done(appendix, ItemStatus.SUCCESS)
+                    except Exception as cb_exc:
+                        logger.warning("on_section_done callback failed: %s", cb_exc)
+
+            except ModelExhaustionError:
+                # Appendix is optional; log but don't fail the whole draft
+                logger.warning(
+                    "Model exhaustion while synthesizing appendix. "
+                    "Skipping ungrouped summaries."
+                )
 
         # Build draft
         draft = MasterDraft(
@@ -141,6 +211,10 @@ class CentralSummarizerAgent(BaseAgent):
         Refine a draft based on reviewer feedback.
 
         Applies edit/reject annotations to produce an improved version.
+        Uses call_llm_resilient for retry/fallback.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         logger.info(
             "Refining draft v%d with %d annotations (%d edits, %d rejects)",
@@ -202,7 +276,10 @@ Produce the refined draft with the same section structure. For each section, inc
 
 Respond with the complete refined draft."""
 
-        response = await self.call_llm(user_prompt=user_prompt)
+        response, model_used = await self.call_llm_resilient(
+            user_prompt=user_prompt,
+            item_id=f"refine_v{draft.version}",
+        )
 
         # Parse the refined draft
         refined_sections = self._parse_draft_response(response.get("text", ""), draft)
@@ -218,10 +295,11 @@ Respond with the complete refined draft."""
         )
 
         logger.info(
-            "Refined draft v%d -> v%d (%d words)",
+            "Refined draft v%d -> v%d (%d words, model: %s)",
             draft.version,
             new_draft.version,
             new_draft.total_word_count,
+            model_used,
         )
 
         return new_draft
@@ -236,7 +314,14 @@ Respond with the complete refined draft."""
         summaries: list[ChunkSummary],
         style_guide: StyleGuide,
     ) -> DraftSection:
-        """Synthesize a single section from its chunk summaries."""
+        """
+        Synthesize a single section from its chunk summaries.
+
+        Uses call_llm_resilient for retry/fallback.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
+        """
         # Build input content
         summaries_text = self._format_summaries(summaries)
         style_context = self._style_guide_to_context(style_guide)
@@ -259,7 +344,10 @@ Write in Spanish. Follow the style guide precisely.
 Write the complete section "{section_title}" following the style guide.
 Include all relevant data points and key facts from the summaries."""
 
-        response = await self.call_llm(user_prompt=user_prompt)
+        response, model_used = await self.call_llm_resilient(
+            user_prompt=user_prompt,
+            item_id=f"section:{section_title[:30]}",
+        )
         content = response.get("text", "")
 
         # Extract chunk IDs referenced

@@ -5,8 +5,8 @@ Coordinates all agents through the full summarization pipeline:
 parse → preprocess → chunk → summarize → style learn → synthesize → review → slides.
 
 Supports stage-by-stage execution with manual checkpoints,
-resumable state, quality gates, retry logic, and human review
-escalation.
+resumable state, quality gates, retry logic, human review
+escalation, and graceful model exhaustion handling.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from src.models import (
     ChunkSummary,
     DocumentParseResult,
     ImagePreprocessStatus,
+    ItemStatus,
     MasterDraft,
     PipelineStage,
     PipelineState,
@@ -53,6 +54,7 @@ from src.storage.document_store import DocumentStore
 from src.storage.vector_store import VectorStore
 
 # Agents
+from src.agents.base import ModelExhaustionError
 from src.agents.preprocessor import PreprocessorAgent
 from src.agents.chunker import Chunker
 from src.agents.chunk_summarizer import ChunkSummarizerAgent
@@ -104,6 +106,7 @@ class Pipeline:
     - Quality gates with retry logic
     - Human review escalation
     - Token budget tracking
+    - Graceful model exhaustion handling (save and stop)
     - Rich console progress display
     """
 
@@ -185,6 +188,33 @@ class Pipeline:
         """Check if a stage has already been completed."""
         return stage in self.state.stages_completed
 
+    def _handle_exhaustion(self, exc: ModelExhaustionError, stage_name: str) -> None:
+        """
+        Handle a ModelExhaustionError: save state, display status, and stop.
+
+        This is called when all models in a fallback chain are exhausted.
+        The pipeline saves all progress and stops cleanly so the user can
+        adjust models/quotas and resume later.
+        """
+        self._save_checkpoint()
+        console.print(
+            Panel(
+                f"[bold red]Model Exhaustion — Pipeline Stopped[/]\n\n"
+                f"Stage: [bold]{stage_name}[/]\n"
+                f"Role: {exc.role}\n"
+                f"Models tried: {', '.join(exc.models_tried)}\n"
+                f"Items completed: [green]{exc.items_completed}[/]\n"
+                f"Items remaining: [red]{exc.items_remaining}[/]\n"
+                f"Last error: {exc.last_error[:200]}\n\n"
+                f"All progress has been saved. To resume:\n"
+                f"  1. Check model quotas / API keys\n"
+                f"  2. Re-run the pipeline (it will resume from checkpoint)\n"
+                f"  3. Or use [bold]--retry-failed[/] to retry only failed items",
+                title="Model Exhaustion",
+                style="bold red",
+            )
+        )
+
     # ------------------------------------------------------------------
     # Manual checkpoint (user confirmation)
     # ------------------------------------------------------------------
@@ -212,7 +242,7 @@ class Pipeline:
         )
 
         # Read input in a non-blocking way
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             response = await loop.run_in_executor(
                 None, lambda: input("Continue? [c/q]: ").strip().lower()
@@ -358,7 +388,7 @@ class Pipeline:
 
                 async def _save_callback(r: DocumentParseResult) -> None:
                     self.store.save_parse_result(r)
-                    self.budget.record_usage(
+                    self.budget.set_cumulative_usage(
                         "preprocessing",
                         self._preprocessor._total_input_tokens,  # type: ignore[union-attr]
                         self._preprocessor._total_output_tokens,  # type: ignore[union-attr]
@@ -366,11 +396,19 @@ class Pipeline:
                     # Also persist pipeline state so we can see progress
                     self._save_checkpoint()
 
-                await self._preprocessor.process_document(
-                    result,
-                    run_id=run_id,
-                    on_image_done=_save_callback,
-                )
+                try:
+                    await self._preprocessor.process_document(
+                        result,
+                        run_id=run_id,
+                        on_image_done=_save_callback,
+                    )
+                except ModelExhaustionError as exc:
+                    self._handle_exhaustion(exc, "Image Preprocessing")
+                    # Save what we have so far and return partial results
+                    self._display_parse_summary(results)
+                    self.state.total_documents = len(results)
+                    self._save_checkpoint()
+                    raise
         else:
             console.print("[dim]All images already preprocessed.[/]")
 
@@ -433,10 +471,11 @@ class Pipeline:
 
     async def stage_summarize_chunks(self, chunks: list[Any]) -> list[ChunkSummary]:
         """
-        Stage 3: Summarize each chunk via Sonnet.
+        Stage 3: Summarize each chunk via Sonnet (with fallback).
 
-        Processes chunks in batches with retry logic for
-        low-confidence outputs.
+        Processes chunks with per-chunk incremental saves and
+        automatic retry/fallback. Raises ModelExhaustionError on
+        exhaustion (after saving all progress).
         """
         stage = PipelineStage.CHUNK_SUMMARIZATION
 
@@ -460,39 +499,52 @@ class Pipeline:
 
         pending_chunks = [c for c in chunks if c.chunk_id not in completed_chunk_ids]
         all_summaries: list[ChunkSummary] = list(existing_summaries)
-        batch_size = pipeline_config.chunk_summary_batch_size
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Summarizing chunks...", total=len(pending_chunks))
-
-            # Process in batches
-            for i in range(0, len(pending_chunks), batch_size):
-                batch = pending_chunks[i : i + batch_size]
-                summaries = await self._chunk_summarizer.summarize_chunks(batch)
-                all_summaries.extend(summaries)
-                self.store.save_chunk_summaries(summaries)
-
-                # Track budget
-                self.budget.record_usage(
+        if not pending_chunks:
+            console.print("[dim]All chunks already summarized.[/]")
+        else:
+            # Per-chunk save callback
+            async def _on_chunk_done(summary: ChunkSummary, status: str) -> None:
+                self.store.save_chunk_summary(summary)
+                self.budget.set_cumulative_usage(
                     "chunk_summarization",
-                    self._chunk_summarizer._total_input_tokens,
-                    self._chunk_summarizer._total_output_tokens,
+                    self._chunk_summarizer._total_input_tokens,  # type: ignore[union-attr]
+                    self._chunk_summarizer._total_output_tokens,  # type: ignore[union-attr]
                 )
-
-                # Persist pipeline state mid-stage
                 self._save_checkpoint()
 
-                progress.update(
-                    task,
-                    advance=len(batch),
-                    description=f"Batch {i // batch_size + 1}: {len(summaries)} summaries",
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    "Summarizing chunks...", total=len(pending_chunks)
                 )
+
+                # Wrap callback to also update progress bar
+                chunk_counter = 0
+
+                async def _on_chunk_done_with_progress(
+                    summary: ChunkSummary, status: str
+                ) -> None:
+                    nonlocal chunk_counter
+                    chunk_counter += 1
+                    await _on_chunk_done(summary, status)
+                    progress.update(
+                        task,
+                        advance=1,
+                        description=f"Chunk {chunk_counter}/{len(pending_chunks)}: "
+                        f"{summary.section_title[:30]}",
+                    )
+
+                new_summaries = await self._chunk_summarizer.summarize_chunks(
+                    pending_chunks,
+                    on_chunk_done=_on_chunk_done_with_progress,
+                )
+                all_summaries.extend(new_summaries)
 
         # Quality gate: confidence check
         confidence_gate = check_summary_confidence(all_summaries)
@@ -517,10 +569,13 @@ class Pipeline:
         self, parse_results: list[DocumentParseResult]
     ) -> StyleGuide:
         """
-        Stage 4: Learn style from example PDFs via Opus.
+        Stage 4: Learn style from example PDFs via Opus (with fallback).
 
         Analyzes style example documents to produce a machine-readable
         style guide for downstream synthesis.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         stage = PipelineStage.STYLE_LEARNING
 
@@ -567,7 +622,7 @@ class Pipeline:
             guide.communication_guidelines = communication_guidelines
 
         # Track budget
-        self.budget.record_usage(
+        self.budget.set_cumulative_usage(
             "style_learning",
             self._style_learner._total_input_tokens,
             self._style_learner._total_output_tokens,
@@ -587,10 +642,13 @@ class Pipeline:
         style_guide: StyleGuide,
     ) -> MasterDraft:
         """
-        Stage 5: Central synthesis via Opus.
+        Stage 5: Central synthesis via Opus (with fallback).
 
         Synthesizes all chunk summaries into a coherent master draft
-        following the style guide.
+        following the style guide. Saves incrementally per section.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         stage = PipelineStage.CENTRAL_SUMMARIZATION
 
@@ -609,13 +667,30 @@ class Pipeline:
             f"Synthesizing {len(chunk_summaries)} summaries into master draft..."
         )
 
+        # Per-section callback for incremental budget tracking
+        section_count = 0
+
+        async def _on_section_done(section: Any, status: str) -> None:
+            nonlocal section_count
+            section_count += 1
+            self.budget.set_cumulative_usage(
+                "central_summarization",
+                self._central_summarizer._total_input_tokens,  # type: ignore[union-attr]
+                self._central_summarizer._total_output_tokens,  # type: ignore[union-attr]
+            )
+            self._save_checkpoint()
+            console.print(
+                f"  [dim]Section {section_count} complete: {section.heading[:40]}[/]"
+            )
+
         draft = await self._central_summarizer.synthesize(
             chunk_summaries=chunk_summaries,
             style_guide=style_guide,
+            on_section_done=_on_section_done,
         )
 
-        # Track budget
-        self.budget.record_usage(
+        # Final budget snapshot
+        self.budget.set_cumulative_usage(
             "central_summarization",
             self._central_summarizer._total_input_tokens,
             self._central_summarizer._total_output_tokens,
@@ -656,6 +731,9 @@ class Pipeline:
 
         The reviewer checks the draft, then the synthesizer refines it.
         Repeats up to max_review_iterations or until quality gate passes.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         stage = PipelineStage.REVIEW
 
@@ -693,7 +771,7 @@ class Pipeline:
             latest_review = review
 
             # Track budget
-            self.budget.record_usage(
+            self.budget.set_cumulative_usage(
                 "reviewer",
                 self._reviewer._total_input_tokens,
                 self._reviewer._total_output_tokens,
@@ -740,7 +818,7 @@ class Pipeline:
                     chunk_summaries=chunk_summaries,
                 )
 
-                self.budget.record_usage(
+                self.budget.set_cumulative_usage(
                     "central_summarization",
                     self._central_summarizer._total_input_tokens,
                     self._central_summarizer._total_output_tokens,
@@ -775,10 +853,13 @@ class Pipeline:
         style_guide: StyleGuide,
     ) -> SlideOutlineSet:
         """
-        Stage 7: Generate slide outlines.
+        Stage 7: Generate slide outlines (with fallback).
 
         Converts the final master draft into 80-100 slide outlines
-        ready for PowerPoint creation.
+        ready for PowerPoint creation. Saves incrementally per section.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         stage = PipelineStage.SLIDE_GENERATION
 
@@ -794,13 +875,27 @@ class Pipeline:
         assert self._slide_generator is not None
 
         console.print("Generating slide outlines...")
+
+        # Per-section callback for incremental tracking
+        async def _on_section_done(
+            slides: list[Any], heading: str, status: str
+        ) -> None:
+            self.budget.set_cumulative_usage(
+                "slide_generation",
+                self._slide_generator._total_input_tokens,  # type: ignore[union-attr]
+                self._slide_generator._total_output_tokens,  # type: ignore[union-attr]
+            )
+            self._save_checkpoint()
+            console.print(f"  [dim]{len(slides)} slides for: {heading[:40]}[/]")
+
         outlines = await self._slide_generator.generate_outlines(
             draft=draft,
             style_guide=style_guide,
+            on_section_done=_on_section_done,
         )
 
-        # Track budget
-        self.budget.record_usage(
+        # Final budget snapshot
+        self.budget.set_cumulative_usage(
             "slide_generation",
             self._slide_generator._total_input_tokens,
             self._slide_generator._total_output_tokens,
@@ -834,6 +929,9 @@ class Pipeline:
         5. Central Synthesis
         6. Review & Refinement
         7. Slide Generation
+
+        If a ModelExhaustionError occurs at any stage, the pipeline
+        saves all progress and stops cleanly.
         """
         try:
             await self.startup()
@@ -876,6 +974,8 @@ class Pipeline:
             # Final report
             self._display_final_report(final_draft, review, slides)
 
+        except ModelExhaustionError as exc:
+            self._handle_exhaustion(exc, self.state.current_stage.value)
         except KeyboardInterrupt:
             console.print("\n[yellow]Pipeline interrupted. Saving state...[/]")
         except Exception as exc:
@@ -1150,11 +1250,18 @@ async def _retry_failed_images_async(all_runs: bool = False) -> None:
             async def _save(r: DocumentParseResult) -> None:
                 store.save_parse_result(r)
 
-            await preprocessor.process_document(
-                result,
-                target_artifact_ids=failed_ids,
-                on_image_done=_save,
-            )
+            try:
+                await preprocessor.process_document(
+                    result,
+                    target_artifact_ids=failed_ids,
+                    on_image_done=_save,
+                )
+            except ModelExhaustionError as exc:
+                console.print(
+                    f"[red]Model exhaustion during retry: {exc}[/]\n"
+                    f"Partial progress saved."
+                )
+                break
 
             after_success = sum(
                 1
@@ -1190,6 +1297,89 @@ async def _retry_failed_images_async(all_runs: bool = False) -> None:
         await client.stop()
 
 
+async def _retry_failed_chunks_async() -> None:
+    """
+    Retry only failed/low-confidence chunk summaries.
+
+    Loads all saved chunks and summaries, identifies chunks whose
+    summaries are missing or failed (confidence == 0.0), and re-runs
+    summarization only on those.
+    """
+    console.print(
+        Panel(
+            "[bold]Retry Failed Chunks Mode[/]\n"
+            "Re-summarizing only failed/missing chunk summaries.",
+            style="bold yellow",
+        )
+    )
+
+    store = DocumentStore()
+    client = OpenCodeClient()
+    await client.start()
+    summarizer = ChunkSummarizerAgent(client)
+
+    try:
+        all_chunks = store.load_all_chunks()
+        if not all_chunks:
+            console.print("[red]No chunks found. Run the full pipeline first.[/]")
+            return
+
+        existing_summaries = store.load_all_chunk_summaries()
+        successful_ids = {
+            s.chunk_id
+            for s in existing_summaries
+            if s.confidence > 0.0 and not s.summary.startswith("[SUMMARIZATION FAILED")
+        }
+
+        pending_chunks = [c for c in all_chunks if c.chunk_id not in successful_ids]
+
+        if not pending_chunks:
+            console.print("[green]No failed chunks found. Nothing to retry.[/]")
+            return
+
+        console.print(
+            f"Found [bold]{len(pending_chunks)}[/] failed/missing chunks "
+            f"out of {len(all_chunks)} total."
+        )
+
+        recovered = 0
+        still_failed = 0
+
+        async def _on_chunk_done(summary: ChunkSummary, status: str) -> None:
+            nonlocal recovered, still_failed
+            store.save_chunk_summary(summary)
+            if status == ItemStatus.SUCCESS:
+                recovered += 1
+            else:
+                still_failed += 1
+
+        try:
+            await summarizer.summarize_chunks(
+                pending_chunks,
+                on_chunk_done=_on_chunk_done,
+            )
+        except ModelExhaustionError as exc:
+            console.print(
+                f"[red]Model exhaustion during retry: {exc}[/]\nPartial progress saved."
+            )
+
+        console.print(
+            Panel(
+                f"Retry complete.\n"
+                f"  Recovered: [bold green]{recovered}[/]\n"
+                f"  Still failed: [bold red]{still_failed}[/]\n"
+                f"  Total token cost: "
+                f"input={summarizer._total_input_tokens:,}, "
+                f"output={summarizer._total_output_tokens:,}",
+                title="Retry Summary",
+                style="cyan",
+            )
+        )
+
+    finally:
+        await client.stop()
+
+
 def main() -> None:
     """CLI entry point for the summarization pipeline."""
     parser = argparse.ArgumentParser(
@@ -1202,6 +1392,14 @@ def main() -> None:
         help=(
             "Retry only failed/pending image descriptions using saved parse results. "
             "Does not re-run parsing or other pipeline stages."
+        ),
+    )
+    parser.add_argument(
+        "--retry-failed-chunks",
+        action="store_true",
+        help=(
+            "Retry only failed/low-confidence chunk summaries. "
+            "Does not re-run parsing, chunking, or other stages."
         ),
     )
     parser.add_argument(
@@ -1225,6 +1423,10 @@ def main() -> None:
 
     if args.retry_failed_images:
         asyncio.run(_retry_failed_images_async(all_runs=args.all_runs))
+        return
+
+    if args.retry_failed_chunks:
+        asyncio.run(_retry_failed_chunks_async())
         return
 
     pipeline = Pipeline()

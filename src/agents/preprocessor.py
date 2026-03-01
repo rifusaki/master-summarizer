@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
-from src.agents.base import BaseAgent
+from src.agents.base import BaseAgent, ModelExhaustionError
 from src.config import FALLBACK_MODELS, ModelConfig, pipeline_config
 from src.models import (
     ArtifactType,
@@ -117,6 +117,7 @@ class PreprocessorAgent(BaseAgent):
         self._fallback_index: int = 0  # which fallback we're currently on
         self._rate_limit_streak: int = 0
         self._fallback_confirmed: bool = False  # user said yes to fallback
+        self._exhausted: bool = False  # all models exhausted, stop processing
 
     # ------------------------------------------------------------------
     # Public API
@@ -144,6 +145,11 @@ class PreprocessorAgent(BaseAgent):
 
         Returns:
             The same parse_result with artifact content/metadata updated.
+
+        Raises:
+            ModelExhaustionError: When all models (primary + fallbacks) are
+                exhausted. Progress up to this point has already been saved
+                via on_image_done callbacks.
         """
         image_artifacts = [
             a
@@ -163,7 +169,25 @@ class PreprocessorAgent(BaseAgent):
             parse_result.source_file,
         )
 
+        completed = 0
         for idx, artifact in enumerate(image_artifacts):
+            # If models are exhausted, mark remaining images and raise
+            if self._exhausted:
+                self._stamp_metadata(
+                    artifact,
+                    status=ImagePreprocessStatus.FAILED_RATE_LIMIT,
+                    model=self._active_model.full_id,
+                    attempts=0,
+                    run_id=run_id,
+                    error="Model exhaustion: all models in fallback chain exhausted",
+                )
+                if on_image_done is not None:
+                    try:
+                        await on_image_done(parse_result)
+                    except Exception as cb_exc:
+                        logger.warning("on_image_done callback failed: %s", cb_exc)
+                continue
+
             await self._process_one_image(
                 artifact=artifact,
                 idx=idx,
@@ -171,11 +195,32 @@ class PreprocessorAgent(BaseAgent):
                 run_id=run_id,
             )
 
+            if (
+                artifact.metadata.get("preprocess_status")
+                == ImagePreprocessStatus.SUCCESS
+            ):
+                completed += 1
+
             if on_image_done is not None:
                 try:
                     await on_image_done(parse_result)
                 except Exception as cb_exc:
                     logger.warning("on_image_done callback failed: %s", cb_exc)
+
+        # After processing all images, if we're exhausted, raise so the
+        # pipeline can stop cleanly
+        if self._exhausted:
+            models_tried = [self.model.full_id] + [
+                m.full_id for m in self._fallback_models[: self._fallback_index]
+            ]
+            remaining = len(image_artifacts) - completed
+            raise ModelExhaustionError(
+                role=self.role,
+                models_tried=models_tried,
+                last_error="Rate limit / timeout exhaustion during image preprocessing",
+                items_completed=completed,
+                items_remaining=remaining,
+            )
 
         return parse_result
 
@@ -322,6 +367,7 @@ class PreprocessorAgent(BaseAgent):
 
         Returns True if a fallback model was activated (either auto or user-confirmed).
         Returns False if no fallback is available or user declined.
+        Sets self._exhausted = True when no more fallback options exist.
         """
         threshold = pipeline_config.preprocessing_rate_limit_streak_threshold
         if self._rate_limit_streak < threshold:
@@ -329,9 +375,11 @@ class PreprocessorAgent(BaseAgent):
 
         if self._fallback_index >= len(self._fallback_models):
             logger.warning(
-                "Rate limit streak=%d but no fallback models remaining.",
+                "Rate limit streak=%d and no fallback models remaining. "
+                "All models exhausted — will stop after saving progress.",
                 self._rate_limit_streak,
             )
+            self._exhausted = True
             return False
 
         next_fallback = self._fallback_models[self._fallback_index]
@@ -362,7 +410,7 @@ class PreprocessorAgent(BaseAgent):
             flush=True,
         )
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             answer = await loop.run_in_executor(None, input)
         except (EOFError, KeyboardInterrupt):
             answer = "n"
@@ -375,7 +423,11 @@ class PreprocessorAgent(BaseAgent):
             logger.info("User confirmed fallback to %s", self._active_model.full_id)
             return True
 
-        logger.info("User declined fallback; continuing with rate-limited model.")
+        logger.info(
+            "User declined fallback. Marking models as exhausted — "
+            "will stop after saving progress."
+        )
+        self._exhausted = True
         return False
 
     # ------------------------------------------------------------------

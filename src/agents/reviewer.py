@@ -1,9 +1,14 @@
 """
-Secondary reviewer agent (GPT-5.3 Codex).
+Secondary reviewer agent (GPT-5.3 Codex, with fallback).
 
 Performs automated cross-checks on the master draft: fact consistency,
 numeric reconciliation, tone verification, and produces a prioritized
 list of edits with Accept/Edit/Reject per paragraph.
+
+Resilience design:
+- Uses call_llm_structured_resilient for retry + fallback.
+- Raises ModelExhaustionError when all models are exhausted,
+  so the pipeline can save state and stop cleanly.
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.agents.base import BaseAgent
+from src.agents.base import BaseAgent, ModelExhaustionError
 from src.models import (
     ChunkSummary,
     MasterDraft,
@@ -85,10 +90,14 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 class ReviewerAgent(BaseAgent):
     """
-    Secondary reviewer using GPT-5.3 Codex.
+    Secondary reviewer using GPT-5.3 Codex (with fallback).
 
     Performs systematic cross-checks on the master draft against
     source summaries and style guide, producing annotated feedback.
+
+    Resilient features:
+    - Automatic retry with fallback model chain via call_llm_structured_resilient.
+    - Raises ModelExhaustionError so the pipeline can stop cleanly.
     """
 
     role = "reviewer"
@@ -104,6 +113,9 @@ class ReviewerAgent(BaseAgent):
         Review the master draft against source summaries and style guide.
 
         Returns annotated review with Accept/Edit/Reject per paragraph.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         logger.info(
             "Reviewing draft v%d (%d sections, %d words)",
@@ -114,21 +126,23 @@ class ReviewerAgent(BaseAgent):
 
         user_prompt = self._build_prompt(draft, style_guide, chunk_summaries)
 
-        result = await self.call_llm_structured(
+        result, model_used = await self.call_llm_structured_resilient(
             user_prompt=user_prompt,
             schema=REVIEW_SCHEMA,
+            item_id=f"review_v{draft.version}",
         )
 
-        review = self._parse_result(result, draft)
+        review = self._parse_result(result, draft, model_used)
 
         logger.info(
             "Review complete: %d annotations (A:%d E:%d R:%d), "
-            "overall confidence: %.2f",
+            "overall confidence: %.2f (model: %s)",
             len(review.annotations),
             review.total_accept,
             review.total_edit,
             review.total_reject,
             review.overall_confidence,
+            model_used,
         )
 
         return review
@@ -197,7 +211,12 @@ For each paragraph, provide: Accept (correct as-is), Edit (needs changes),
 or Reject (factually wrong or severely off-style).
 Include a risk register for any high-risk claims."""
 
-    def _parse_result(self, result: dict[str, Any], draft: MasterDraft) -> ReviewResult:
+    def _parse_result(
+        self,
+        result: dict[str, Any],
+        draft: MasterDraft,
+        model_used: str = "",
+    ) -> ReviewResult:
         """Parse structured review output into ReviewResult."""
         # Map section headings to IDs
         heading_to_id = {s.heading: s.section_id for s in draft.sections}
@@ -205,7 +224,7 @@ Include a risk register for any high-risk claims."""
         annotations = []
         for ann_data in result.get("annotations", []):
             heading = ann_data.get("section_heading", "")
-            section_id = heading_to_id.get(heading, heading)
+            section_id = heading_to_id.get(heading, heading) or ""
 
             verdict_str = ann_data.get("verdict", "accept")
             try:
@@ -231,6 +250,10 @@ Include a risk register for any high-risk claims."""
         total_edit = sum(1 for a in annotations if a.verdict == ReviewVerdict.EDIT)
         total_reject = sum(1 for a in annotations if a.verdict == ReviewVerdict.REJECT)
 
+        provenance = self.create_provenance()
+        if model_used:
+            provenance.model = model_used
+
         return ReviewResult(
             draft_id=draft.draft_id,
             draft_version=draft.version,
@@ -241,5 +264,5 @@ Include a risk register for any high-risk claims."""
             risk_register=result.get("risk_register", []),
             overall_confidence=result.get("overall_confidence", 0.0),
             reviewer_notes=result.get("reviewer_notes", ""),
-            provenance=self.create_provenance(),
+            provenance=provenance,
         )

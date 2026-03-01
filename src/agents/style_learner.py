@@ -1,9 +1,14 @@
 """
-Style learning agent (Claude Opus 4.6).
+Style learning agent (Claude Opus 4.6, with fallback).
 
 Ingests preprocessed example documents and explicit communication
 guidelines to infer a comprehensive set of style rules as a
 machine-readable JSON style guide.
+
+Resilience design:
+- Uses call_llm_structured_resilient for retry + fallback.
+- Raises ModelExhaustionError when all models are exhausted,
+  so the pipeline can save state and stop cleanly.
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.agents.base import BaseAgent
+from src.agents.base import BaseAgent, ModelExhaustionError
 from src.models import (
     DocumentParseResult,
     PipelineStage,
@@ -114,10 +119,14 @@ STYLE_GUIDE_SCHEMA: dict[str, Any] = {
 
 class StyleLearnerAgent(BaseAgent):
     """
-    Style learning agent using Claude Opus 4.6.
+    Style learning agent using Claude Opus 4.6 (with fallback).
 
     Analyzes example executive summary documents to infer
     a comprehensive, machine-readable style guide.
+
+    Resilient features:
+    - Automatic retry with fallback model chain.
+    - Raises ModelExhaustionError so the pipeline can stop cleanly.
     """
 
     role = "style_learning"
@@ -137,23 +146,28 @@ class StyleLearnerAgent(BaseAgent):
 
         Returns:
             A comprehensive StyleGuide with rules, checklist, and rubric.
+
+        Raises:
+            ModelExhaustionError: When all models are exhausted.
         """
         logger.info("Learning style from %d example documents", len(example_docs))
 
         # Build the analysis prompt
         user_prompt = self._build_prompt(example_docs, communication_guidelines)
 
-        result = await self.call_llm_structured(
+        result, model_used = await self.call_llm_structured_resilient(
             user_prompt=user_prompt,
             schema=STYLE_GUIDE_SCHEMA,
+            item_id="style_guide",
         )
 
-        guide = self._parse_result(result, example_docs)
+        guide = self._parse_result(result, example_docs, model_used)
 
         logger.info(
-            "Style guide generated: %d rules, %d checklist items",
+            "Style guide generated: %d rules, %d checklist items (model: %s)",
             len(guide.rules),
             len(guide.reviewer_checklist),
+            model_used,
         )
 
         return guide
@@ -187,14 +201,14 @@ class StyleLearnerAgent(BaseAgent):
         # Add example document content (text only, truncated to fit context)
         for doc in example_docs:
             parts.append(f"\n# Example Document: {doc.source_file}\n")
-            parts.append(f"## Structure\n")
+            parts.append("## Structure\n")
 
             # Add heading structure
             for h in doc.heading_structure[:50]:
                 indent = "  " * (h.get("level", 1) - 1)
                 parts.append(f"{indent}- {h.get('text', '')}")
 
-            parts.append(f"\n## Content Excerpts\n")
+            parts.append("\n## Content Excerpts\n")
 
             # Add representative text excerpts (avoid sending everything)
             char_budget = 30000  # per document
@@ -212,7 +226,10 @@ class StyleLearnerAgent(BaseAgent):
         return "\n".join(parts)
 
     def _parse_result(
-        self, result: dict[str, Any], example_docs: list[DocumentParseResult]
+        self,
+        result: dict[str, Any],
+        example_docs: list[DocumentParseResult],
+        model_used: str = "",
     ) -> StyleGuide:
         """Parse the structured output into a StyleGuide model."""
         rules = [
@@ -226,6 +243,12 @@ class StyleLearnerAgent(BaseAgent):
             for r in result.get("rules", [])
         ]
 
+        provenance = self.create_provenance(
+            chunk_ids=[d.document_id for d in example_docs],
+        )
+        if model_used:
+            provenance.model = model_used
+
         return StyleGuide(
             section_order=result.get("section_order", []),
             preferred_headings=result.get("preferred_headings", []),
@@ -238,7 +261,5 @@ class StyleLearnerAgent(BaseAgent):
             target_reader=result.get("target_reader", ""),
             reviewer_checklist=result.get("reviewer_checklist", []),
             source_documents=[d.source_file for d in example_docs],
-            provenance=self.create_provenance(
-                chunk_ids=[d.document_id for d in example_docs],
-            ),
+            provenance=provenance,
         )

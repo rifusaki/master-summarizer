@@ -382,6 +382,36 @@ class ImagePreprocessStatus:
     FAILED_OTHER = "failed_other"
 
 
+class ItemStatus:
+    """
+    Generic status constants for per-item tracking across all pipeline stages.
+
+    Used in metadata dicts and stage_progress to indicate the outcome of
+    processing each work unit (chunk summary, section draft, review, etc.).
+    """
+
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED_TIMEOUT = "failed_timeout"
+    FAILED_RATE_LIMIT = "failed_rate_limit"
+    FAILED_MODEL_EXHAUSTED = "failed_model_exhausted"
+    FAILED_OTHER = "failed_other"
+
+    @classmethod
+    def is_failed(cls, status: str | None) -> bool:
+        """Return True if the status represents any kind of failure."""
+        if not status:
+            return False
+        return status.startswith("failed_")
+
+    @classmethod
+    def needs_processing(cls, status: str | None) -> bool:
+        """Return True if the item needs (re-)processing."""
+        if status is None or status == cls.PENDING:
+            return True
+        return cls.is_failed(status)
+
+
 class PipelineState(BaseModel):
     """Overall state of the pipeline for checkpointing and resume."""
 
