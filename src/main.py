@@ -1206,21 +1206,32 @@ def _is_failed_image(artifact: Any) -> bool:
     return False
 
 
-async def _retry_failed_images_async(all_runs: bool = False) -> None:
+async def _retry_failed_images_async(
+    all_runs: bool = False,
+    preprocess_model: str | None = None,
+) -> None:
     """
     Async impl of --retry-failed-images mode.
 
     Loads all saved parse results, identifies failed/unprocessed image artifacts,
     and runs preprocessing only on those using the current model config (with
     fallback support). Persists results after each image.
+
+    Args:
+        all_runs: If True, retry images failed in any prior run, not just the
+            most recent one.
+        preprocess_model: Optional "provider/model" string to override the
+            default preprocessing model for this retry run only. Successfully
+            described images are never re-processed regardless of this setting.
     """
     from src.config import PREPROCESSED_DIR
     from src.storage.vector_store import VectorStore
 
+    model_note = f" (model: {preprocess_model})" if preprocess_model else ""
     console.print(
         Panel(
-            "[bold]Retry Failed Images Mode[/]\n"
-            "Reprocessing only failed/pending image descriptions.",
+            f"[bold]Retry Failed Images Mode[/]\n"
+            f"Reprocessing only failed/pending image descriptions{model_note}.",
             style="bold yellow",
         )
     )
@@ -1229,6 +1240,24 @@ async def _retry_failed_images_async(all_runs: bool = False) -> None:
     client = OpenCodeClient()
     await client.start()
     preprocessor = PreprocessorAgent(client)
+
+    if preprocess_model:
+        parts = preprocess_model.split("/", 1)
+        if len(parts) == 2:
+            from src.config import ModelConfig
+
+            override = ModelConfig(
+                provider_id=parts[0],
+                model_id=parts[1],
+                context_window=1_048_576,
+                max_output=65_536,
+                supports_images=True,
+                supports_pdf=True,
+            )
+            preprocessor.set_active_model(override)
+            console.print(
+                f"[yellow]Preprocessing model overridden: {preprocess_model}[/]"
+            )
 
     try:
         results = store.load_all_parse_results()
@@ -1459,7 +1488,12 @@ def main() -> None:
     )
 
     if args.retry_failed_images:
-        asyncio.run(_retry_failed_images_async(all_runs=args.all_runs))
+        asyncio.run(
+            _retry_failed_images_async(
+                all_runs=args.all_runs,
+                preprocess_model=args.preprocess_model,
+            )
+        )
         return
 
     if args.retry_failed_chunks:
