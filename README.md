@@ -104,6 +104,12 @@ uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz
 
 # Import overwriting existing output
 uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz --force
+
+# Delete all run data (prompts for confirmation)
+uv run summarizer --clean
+
+# Delete all run data without prompting
+uv run summarizer --clean --force
 ```
 
 **Flag compatibility notes:**
@@ -115,9 +121,10 @@ uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz --force
 | `--retry-failed-images --all-runs --preprocess-model X` | Yes | Same as above; `--preprocess-model` applies correctly |
 | `--retry-failed-chunks --preprocess-model X` | Ignored | `--preprocess-model` is silently ignored — it only controls Gemini preprocessing, not chunk summarization |
 | `--retry-failed-chunks --all-runs` | Ignored | `--all-runs` is silently ignored — it only applies to `--retry-failed-images` |
-| `--export-run --full` | Yes | Includes `output/preprocessed/` in the archive |
+| `--export-run --full` | Yes | Also includes `output/preprocessed/` and `input/` source files |
 | `--export-run --output-path PATH` | Yes | Saves archive to the given path instead of project root |
 | `--import-run ARCHIVE --force` | Yes | Overwrites existing `output/` data |
+| `--clean --force` | Yes | Skips the confirmation prompt |
 
 ### Archiving Runs
 
@@ -130,7 +137,7 @@ uv run summarizer --export-run
 
 **What's included by default** (~6 MB): chunks, chunk summaries, drafts, style guide, reviews, slides, pipeline state, final deliverables (`summary.md`, `slides.md`), and `review/` files.
 
-**What's excluded by default** (~918 MB): `output/preprocessed/` (parsed documents with base64 images). Use `--full` to include it.
+**What's excluded by default** (~918 MB): `output/preprocessed/` (parsed documents with base64 images) and `input/` (source DOCX/PDF files). Use `--full` to include both.
 
 The archive contains a `manifest.json` with full run metadata (run ID, timestamps, stages completed, document/chunk/summary counts, cost).
 
@@ -141,6 +148,15 @@ uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz
 ```
 
 Import checks for existing data in `output/` and aborts unless `--force` is passed. After import, the pipeline can resume from where it left off if the run was partial.
+
+To delete all run data after exporting (or when starting fresh):
+
+```bash
+uv run summarizer --clean          # prompts for confirmation
+uv run summarizer --clean --force  # skips prompt
+```
+
+Deletes `output/`, generated `review/` files, and `data/chroma/`. Preserves `input/` and git-tracked files (`review/architecture_and_prompts.md`). Empty directory skeletons are recreated so the next run starts cleanly.
 
 ## Output
 

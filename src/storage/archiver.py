@@ -21,6 +21,9 @@ Archive layout::
     │   ├── reviews/
     │   ├── slides/
     │   └── preprocessed/          ← only with --full
+    ├── input/                     ← only with --full
+    │   ├── raw_data/
+    │   └── style_examples/
     └── review/
         └── *.md
 
@@ -41,7 +44,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.config import OUTPUT_DIR, REVIEW_DIR, PREPROCESSED_DIR, PROJECT_ROOT
+from src.config import (
+    OUTPUT_DIR,
+    REVIEW_DIR,
+    PREPROCESSED_DIR,
+    INPUT_DIR,
+    PROJECT_ROOT,
+    CHROMA_DIR,
+)
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -174,11 +184,16 @@ def _collect_files(full: bool) -> list[Path]:
                 if filepath.is_file():
                     files.append(filepath)
 
-    # Full mode: include preprocessed/
-    if full and PREPROCESSED_DIR.is_dir():
-        for filepath in sorted(PREPROCESSED_DIR.rglob("*")):
-            if filepath.is_file():
-                files.append(filepath)
+    # Full mode: include preprocessed/ and input/
+    if full:
+        if PREPROCESSED_DIR.is_dir():
+            for filepath in sorted(PREPROCESSED_DIR.rglob("*")):
+                if filepath.is_file():
+                    files.append(filepath)
+        if INPUT_DIR.is_dir():
+            for filepath in sorted(INPUT_DIR.rglob("*")):
+                if filepath.is_file() and filepath.name != ".DS_Store":
+                    files.append(filepath)
 
     # Review directory
     if REVIEW_DIR.is_dir():
@@ -197,7 +212,7 @@ def export_run(
     Export the current run as a tar.gz archive.
 
     Args:
-        full: If True, include output/preprocessed/ (large).
+        full: If True, include output/preprocessed/ and input/ (large).
         output_path: Explicit path for the archive file. If None,
             auto-generates a name in the project root.
 
@@ -360,8 +375,8 @@ def import_run(
     # Extract
     console.print("Extracting archive...")
 
-    # Security: only extract paths that start with output/ or review/ or manifest.json
-    allowed_prefixes = ("output/", "review/", "manifest.json")
+    # Security: only extract paths that start with output/ or review/ or input/ or manifest.json
+    allowed_prefixes = ("output/", "review/", "input/", "manifest.json")
 
     with tarfile.open(archive_path, "r:gz") as tar:
         members_to_extract: list[tarfile.TarInfo] = []
@@ -474,6 +489,132 @@ def _display_import_summary(manifest: dict[str, Any], files_extracted: int) -> N
             f"Output restored to: output/\n"
             f"Review files restored to: review/",
             title="Import Complete",
+            style="bold green",
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Clean
+# ---------------------------------------------------------------------------
+
+# Git-tracked files inside review/ that must never be deleted.
+_REVIEW_KEEP = {"architecture_and_prompts.md"}
+
+
+def clean_run(force: bool = False) -> None:
+    """
+    Delete all data produced by the current run.
+
+    Removes output/, review/ generated files, and data/chroma/.
+    Recreates empty directory skeletons so the project stays ready for
+    a fresh run.
+
+    Preserves:
+    - input/           (source documents, user-managed)
+    - review/architecture_and_prompts.md  (git-tracked)
+    - All code, config, and prompt files
+
+    Args:
+        force: If True, skip the confirmation prompt.
+
+    Raises:
+        SystemExit: If the user declines the confirmation prompt.
+    """
+    has_data = _has_existing_output() or (
+        CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir())
+    )
+
+    if not has_data:
+        console.print("[green]No run data found — nothing to delete.[/]")
+        return
+
+    # Build a human-readable summary of what will be deleted
+    targets: list[tuple[str, str]] = []  # (display path, type)
+
+    if OUTPUT_DIR.exists():
+        targets.append(("output/", "directory"))
+    if REVIEW_DIR.exists():
+        review_files = [
+            f
+            for f in REVIEW_DIR.iterdir()
+            if f.is_file() and f.name not in _REVIEW_KEEP
+        ]
+        if review_files:
+            targets.append((f"review/  ({len(review_files)} generated files)", "files"))
+    if CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir()):
+        targets.append(("data/chroma/", "directory"))
+
+    if not targets:
+        console.print("[green]No run data found — nothing to delete.[/]")
+        return
+
+    target_lines = "\n".join(f"  • {label}" for label, _ in targets)
+    console.print(
+        Panel(
+            f"[bold red]The following will be permanently deleted:[/]\n\n"
+            f"{target_lines}\n\n"
+            f"[dim]Preserved: input/, review/architecture_and_prompts.md, "
+            f"all code and prompts[/]",
+            title="Clean Run",
+            style="bold red",
+        )
+    )
+
+    if not force:
+        try:
+            answer = input("Delete all run data? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]Aborted.[/]")
+            raise SystemExit(0)
+        if answer not in ("y", "yes"):
+            console.print("[yellow]Aborted — nothing was deleted.[/]")
+            raise SystemExit(0)
+
+    deleted_dirs: list[str] = []
+    deleted_files: int = 0
+
+    # Delete output/
+    if OUTPUT_DIR.exists():
+        import shutil
+
+        shutil.rmtree(OUTPUT_DIR)
+        deleted_dirs.append("output/")
+
+    # Delete generated review/ files (keep git-tracked ones)
+    if REVIEW_DIR.exists():
+        for filepath in list(REVIEW_DIR.iterdir()):
+            if filepath.is_file() and filepath.name not in _REVIEW_KEEP:
+                filepath.unlink()
+                deleted_files += 1
+            elif filepath.is_dir():
+                import shutil
+
+                shutil.rmtree(filepath)
+
+    # Delete chroma/
+    if CHROMA_DIR.exists():
+        import shutil
+
+        shutil.rmtree(CHROMA_DIR)
+        deleted_dirs.append("data/chroma/")
+
+    # Recreate empty skeletons so the next run finds expected directories
+    from src.config import ensure_output_dirs
+
+    ensure_output_dirs()
+
+    summary_parts = []
+    if deleted_dirs:
+        summary_parts.append(f"Deleted: {', '.join(deleted_dirs)}")
+    if deleted_files:
+        summary_parts.append(f"Deleted {deleted_files} file(s) from review/")
+    summary_parts.append("Empty output/, review/, and data/chroma/ recreated.")
+
+    console.print(
+        Panel(
+            "[bold green]Clean complete[/]\n\n" + "\n".join(summary_parts),
+            title="Clean Complete",
             style="bold green",
         )
     )

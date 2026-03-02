@@ -1681,7 +1681,17 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="With --import-run: overwrite existing output/ data.",
+        help="With --import-run: overwrite existing output/ data. "
+        "With --clean: skip the confirmation prompt.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "Delete all run data: output/, generated review/ files, and data/chroma/. "
+            "Preserves input/ and git-tracked files. "
+            "Prompts for confirmation unless --force is also passed."
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -1746,6 +1756,18 @@ def main() -> None:
             style="bold blue",
         )
     )
+
+    if args.clean:
+        from src.storage.archiver import clean_run
+
+        try:
+            clean_run(force=args.force)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            console.print(f"[red]Clean failed: {exc}[/]")
+            sys.exit(1)
+        return
 
     if args.export_run:
         from src.storage.archiver import export_run
