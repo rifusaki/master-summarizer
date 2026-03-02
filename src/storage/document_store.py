@@ -209,6 +209,25 @@ class DocumentStore:
     def load_draft(self, version: int) -> MasterDraft:
         return self._load(MasterDraft, DRAFTS_DIR / f"draft_v{version}.json")
 
+    def load_synthesis_draft(self) -> MasterDraft | None:
+        """
+        Load the synthesis-stage output draft (always version=1).
+
+        This must be used by stage_synthesize on resume rather than
+        load_latest_draft(), so the review/refinement loop always starts
+        from the original synthesized draft and not from a mid-refinement
+        version saved by a prior Stage 6 run.
+
+        Falls back to the lowest available version if v1 is missing.
+        """
+        try:
+            return self.load_draft(version=1)
+        except Exception:
+            drafts = self._load_all(MasterDraft, DRAFTS_DIR)
+            if not drafts:
+                return None
+            return min(drafts, key=lambda d: d.version)
+
     def load_latest_draft(self) -> MasterDraft | None:
         drafts = self._load_all(MasterDraft, DRAFTS_DIR)
         return max(drafts, key=lambda d: d.version) if drafts else None

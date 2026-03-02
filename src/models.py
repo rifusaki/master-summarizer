@@ -309,7 +309,7 @@ class ReviewResult(BaseModel):
     total_edit: int = 0
     total_reject: int = 0
     # Risk register
-    risk_register: list[dict[str, str]] = Field(default_factory=list)
+    risk_register: list[dict[str, Any]] = Field(default_factory=list)
     # Overall assessment
     overall_confidence: float = 0.0
     reviewer_notes: str = ""

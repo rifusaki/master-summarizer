@@ -273,11 +273,18 @@ class CentralSummarizerAgent(BaseAgent):
         # Build style context
         style_context = self._style_guide_to_context(style_guide)
 
+        min_words = max(int(len(draft_text.split()) * 0.85), 1500)
+
         user_prompt = f"""# Draft Refinement Task
 
 Apply the following reviewer feedback to improve the master draft.
 Maintain the same structure and style. Only modify sections that have feedback.
 Preserve all source references and provenance markers.
+
+CRITICAL: The refined draft MUST preserve all sections and must be AT LEAST {min_words} words.
+Do NOT delete or shorten sections that were not flagged. Rejected paragraphs must be
+rewritten with corrected content, not removed. The output must be a COMPLETE document,
+not a summary of changes.
 
 ## Style Requirements
 {style_context}
@@ -291,12 +298,12 @@ Preserve all source references and provenance markers.
 ## Current Draft
 {draft_text}
 
-Produce the refined draft with the same section structure. For each section, include:
-1. Section heading
-2. Refined content
-3. List of source chunk IDs used
+Produce the complete refined draft with the same section structure. For each section, include:
+1. Section heading (use the exact same headings as the current draft)
+2. Refined content (rewrite flagged paragraphs; keep unflagged ones intact)
+3. All source chunk IDs preserved
 
-Respond with the complete refined draft."""
+Respond with the COMPLETE refined draft (all {len(draft.sections)} sections)."""
 
         response, model_used = await self.call_llm_resilient(
             user_prompt=user_prompt,

@@ -101,13 +101,13 @@ MODELS: dict[str, ModelConfig] = {
         supports_images=True,
     ),
     "reviewer": ModelConfig(
-        provider_id="azure-gpt",
+        provider_id="github-copilot",
         model_id="gpt-5.2",
         context_window=200_000,
         max_output=100_000,
     ),
     "slide_generation": ModelConfig(
-        provider_id="azure-gpt",
+        provider_id="github-copilot",
         model_id="gpt-5.2",
         context_window=200_000,
         max_output=100_000,
@@ -143,9 +143,27 @@ FALLBACK_MODELS: dict[str, list[ModelConfig]] = {
             supports_images=True,
         ),
     ],
+    "style_learning": [
+        ModelConfig(
+            provider_id="openrouter",
+            model_id="anthropic/claude-opus-4.6",
+            context_window=128_000,
+            max_output=64_000,
+            supports_images=True,
+        ),
+    ],
+    "central_summarization": [
+        ModelConfig(
+            provider_id="openrouter",
+            model_id="anthropic/claude-opus-4.6",
+            context_window=128_000,
+            max_output=64_000,
+            supports_images=True,
+        ),
+    ],
     "reviewer": [
         ModelConfig(
-            provider_id="github-copilot",
+            provider_id="azure-gpt",
             model_id="gpt-5.2",
             context_window=200_000,
             max_output=100_000,
@@ -153,7 +171,7 @@ FALLBACK_MODELS: dict[str, list[ModelConfig]] = {
     ],
     "slide_generation": [
         ModelConfig(
-            provider_id="github-copilot",
+            provider_id="azure-gpt",
             model_id="gpt-5.2",
             context_window=200_000,
             max_output=100_000,
@@ -202,7 +220,11 @@ class PipelineConfig:
     max_bullets_per_slide: int = 5
 
     # Timeouts (seconds)
-    llm_timeout: int = 300  # 5 minutes per LLM call
+    llm_timeout: int = field(
+        default_factory=lambda: int(
+            os.getenv("LLM_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT", "900"))
+        )
+    )
     server_startup_timeout: int = 30
 
     # Preprocessing resilience

@@ -12,6 +12,12 @@ You receive:
 
 You produce a detailed, annotated review with Accept/Edit/Reject verdicts per paragraph, plus a risk register.
 
+## Context
+
+This draft is the output of an automated synthesis pipeline that compressed approximately 196 source chunks from multiple planning documents into a single executive summary. The draft is intentionally dense source material intended to drive an 80–100 slide presentation — a complete, well-formed draft covering this volume of source material will typically be 2,000–4,000 words. That level of compression is correct and expected.
+
+Do not penalise a draft for being concise if its facts are accurate. Evaluate what is present, not what could theoretically have been included. Incompleteness relative to the full source volume is not a defect on its own — the synthesis agent already made deliberate decisions about what to include.
+
 ## Review Dimensions
 
 ### 1. Fact Consistency
@@ -67,15 +73,19 @@ Respond with a JSON object containing:
   - `description`: What the risk is
   - `affected_sections`: Which sections are affected
 
-- `overall_confidence` (number, 0-1): Your overall confidence in the draft's quality
+- `overall_confidence` (number, 0–1): Your overall confidence in the draft's **factual accuracy and style compliance** — not its completeness relative to the total source volume. Calibration anchors:
+  - **0.85–1.0**: Mostly accurate, minor issues only
+  - **0.70–0.85**: Accurate but with notable gaps or style deviations
+  - **0.50–0.70**: Significant issues requiring substantial edits
+  - **below 0.50**: Severe factual errors, fabricated data, or the draft is structurally unsound
 
 - `reviewer_notes` (string): General observations and recommendations
 
 ## Verdict Guidelines
 
-- **Accept**: The paragraph is factually correct, stylistically compliant, and well-written.
-- **Edit**: The paragraph has minor issues that can be fixed (wording, formatting, missing citations, slight numeric mismatches). Provide the corrected version.
-- **Reject**: The paragraph contains factual errors, unsupported claims, or severe style violations. Explain what is wrong and why it cannot be salvaged with minor edits.
+- **Accept**: The paragraph is factually correct, stylistically compliant, and well-written. A healthy review will have the majority of paragraphs as Accept.
+- **Edit**: The paragraph has fixable issues — wording, formatting, missing citation, slight numeric mismatch, or a claim that could be better supported. Also use Edit when a paragraph is accurate but could be meaningfully improved. Provide the corrected version.
+- **Reject**: Reserved for paragraphs with **outright factual errors**, fabricated data, or claims that directly contradict source material. Incompleteness alone does not justify Reject — use Edit instead. A healthy review has **fewer than 15% Reject verdicts**; if you find yourself assigning more, reconsider whether Edit is more appropriate for each case.
 
 ## Risk Level Guidelines
 

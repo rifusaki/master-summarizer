@@ -654,8 +654,17 @@ class Pipeline:
 
         if self._is_stage_complete(stage):
             console.print("[dim]Synthesis already complete, loading...[/]")
-            draft = self.store.load_latest_draft()
+            # Always load v1 — the synthesis output. Refined drafts (v2, v3, ...)
+            # are produced by stage_review and must not be returned here, or the
+            # review loop would restart from a mid-refinement state on resume.
+            draft = self.store.load_synthesis_draft()
             if draft:
+                if draft.version > 1:
+                    logger.warning(
+                        "draft_v1.json not found on resume; "
+                        "using lowest available version (v%d)",
+                        draft.version,
+                    )
                 return draft
 
         self.state.current_stage = stage
@@ -823,7 +832,8 @@ class Pipeline:
             if iteration < max_iterations:
                 # Refine
                 console.print("Refining draft based on feedback...")
-                current_draft = await self._central_summarizer.refine_with_feedback(
+                pre_refine_words = current_draft.total_word_count
+                refined_draft = await self._central_summarizer.refine_with_feedback(
                     draft=current_draft,
                     review=review,
                     style_guide=style_guide,
@@ -836,6 +846,30 @@ class Pipeline:
                     self._central_summarizer._total_output_tokens,
                 )
 
+                # Guard against catastrophic collapse: if the refined draft lost
+                # more than 40% of words the refiner over-corrected. Keep the
+                # previous draft in that case and stop iterating.
+                collapse_ratio = refined_draft.total_word_count / max(
+                    pre_refine_words, 1
+                )
+                if collapse_ratio < 0.60:
+                    console.print(
+                        f"[yellow]Warning: refined draft shrank by "
+                        f"{(1 - collapse_ratio):.0%} "
+                        f"({pre_refine_words} -> {refined_draft.total_word_count} words). "
+                        f"Discarding refinement and keeping v{current_draft.version}.[/]"
+                    )
+                    logger.warning(
+                        "Refinement collapsed draft by %.0f%% (%d -> %d words); "
+                        "keeping v%d",
+                        (1 - collapse_ratio) * 100,
+                        pre_refine_words,
+                        refined_draft.total_word_count,
+                        current_draft.version,
+                    )
+                    break
+
+                current_draft = refined_draft
                 self.store.save_draft(current_draft)
                 console.print(
                     f"Refined to draft v{current_draft.version}: "
