@@ -141,6 +141,7 @@ All inter-agent communication uses Pydantic models defined in `src/models.py`:
 
 - File-based: `DocumentStore` (`src/storage/document_store.py`) — JSON files in `output/` subdirectories.
 - Vector: `VectorStore` (`src/storage/vector_store.py`) — ChromaDB in `data/chroma/` for chunk embeddings.
+- Archiver: `src/storage/archiver.py` — `export_run()` / `import_run()` for portable tar.gz snapshots of completed or partial runs. Invoked via `--export-run` and `--import-run` CLI flags.
 
 ## Quality & Provenance
 

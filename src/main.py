@@ -1646,6 +1646,47 @@ def main() -> None:
         prog="summarizer",
         description="Master Summarizer — multi-agent POT document pipeline",
     )
+    # ------------------------------------------------------------------
+    # Archive commands
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--export-run",
+        action="store_true",
+        help=(
+            "Export the current run as a tar.gz archive for backup or sharing. "
+            "By default excludes preprocessed/ (918 MB+). Use --full to include it."
+        ),
+    )
+    parser.add_argument(
+        "--import-run",
+        metavar="ARCHIVE",
+        default=None,
+        help=(
+            "Import a previously exported run archive (.tar.gz), restoring "
+            "output/ and review/ directories. Requires --force if output/ "
+            "already contains data."
+        ),
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="With --export-run: include output/preprocessed/ in the archive.",
+    )
+    parser.add_argument(
+        "--output-path",
+        metavar="PATH",
+        default=None,
+        help="With --export-run: explicit path for the archive file.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --import-run: overwrite existing output/ data.",
+    )
+
+    # ------------------------------------------------------------------
+    # Retry commands
+    # ------------------------------------------------------------------
     parser.add_argument(
         "--retry-failed-images",
         action="store_true",
@@ -1705,6 +1746,27 @@ def main() -> None:
             style="bold blue",
         )
     )
+
+    if args.export_run:
+        from src.storage.archiver import export_run
+
+        try:
+            output_path = Path(args.output_path) if args.output_path else None
+            export_run(full=args.full, output_path=output_path)
+        except (FileNotFoundError, RuntimeError) as exc:
+            console.print(f"[red]Export failed: {exc}[/]")
+            sys.exit(1)
+        return
+
+    if args.import_run:
+        from src.storage.archiver import import_run
+
+        try:
+            import_run(archive_path=Path(args.import_run), force=args.force)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            console.print(f"[red]Import failed: {exc}[/]")
+            sys.exit(1)
+        return
 
     if args.retry_failed_images:
         asyncio.run(

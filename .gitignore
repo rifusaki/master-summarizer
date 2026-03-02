@@ -22,6 +22,9 @@ review/*
 input/raw_data/
 input/style_examples/
 
+# Run archives (created by --export-run)
+*.tar.gz
+
 # OS
 .DS_Store
 Thumbs.db

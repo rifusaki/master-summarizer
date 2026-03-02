@@ -89,17 +89,58 @@ uv run summarizer --retry-failed-images --preprocess-model openrouter/google/gem
 
 # Retry only failed/low-confidence chunk summaries
 uv run summarizer --retry-failed-chunks
+
+# Export the current run as a portable archive
+uv run summarizer --export-run
+
+# Export including preprocessed images (~930 MB vs ~6 MB)
+uv run summarizer --export-run --full
+
+# Export to a specific path
+uv run summarizer --export-run --output-path /path/to/backup.tar.gz
+
+# Import a previously exported run
+uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz
+
+# Import overwriting existing output
+uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz --force
 ```
 
 **Flag compatibility notes:**
 
 | Flag combination | Works? | Notes |
 |-----------------|--------|-------|
-| `--retry-failed-images --preprocess-model X` | ✅ | Correct recovery workflow |
-| `--retry-failed-images --all-runs` | ✅ | `--all-runs` is accepted but currently a no-op — retry already covers all runs by default |
-| `--retry-failed-images --all-runs --preprocess-model X` | ✅ | Same as above; `--preprocess-model` applies correctly |
-| `--retry-failed-chunks --preprocess-model X` | ⚠️ | `--preprocess-model` is silently ignored — it only controls Gemini preprocessing, not chunk summarization |
-| `--retry-failed-chunks --all-runs` | ⚠️ | `--all-runs` is silently ignored — it only applies to `--retry-failed-images` |
+| `--retry-failed-images --preprocess-model X` | Yes | Correct recovery workflow |
+| `--retry-failed-images --all-runs` | Yes | `--all-runs` is accepted but currently a no-op — retry already covers all runs by default |
+| `--retry-failed-images --all-runs --preprocess-model X` | Yes | Same as above; `--preprocess-model` applies correctly |
+| `--retry-failed-chunks --preprocess-model X` | Ignored | `--preprocess-model` is silently ignored — it only controls Gemini preprocessing, not chunk summarization |
+| `--retry-failed-chunks --all-runs` | Ignored | `--all-runs` is silently ignored — it only applies to `--retry-failed-images` |
+| `--export-run --full` | Yes | Includes `output/preprocessed/` in the archive |
+| `--export-run --output-path PATH` | Yes | Saves archive to the given path instead of project root |
+| `--import-run ARCHIVE --force` | Yes | Overwrites existing `output/` data |
+
+### Archiving Runs
+
+The pipeline stores all artifacts in `output/` and `review/`, both of which are gitignored. To preserve a completed (or partial) run for backup or later use:
+
+```bash
+# Export — creates run_YYYY-MM-DD_<run-id>.tar.gz in the project root
+uv run summarizer --export-run
+```
+
+**What's included by default** (~6 MB): chunks, chunk summaries, drafts, style guide, reviews, slides, pipeline state, final deliverables (`summary.md`, `slides.md`), and `review/` files.
+
+**What's excluded by default** (~918 MB): `output/preprocessed/` (parsed documents with base64 images). Use `--full` to include it.
+
+The archive contains a `manifest.json` with full run metadata (run ID, timestamps, stages completed, document/chunk/summary counts, cost).
+
+To restore a run on a fresh clone or after clearing `output/`:
+
+```bash
+uv run summarizer --import-run run_2026-03-01_0d014ec1.tar.gz
+```
+
+Import checks for existing data in `output/` and aborts unless `--force` is passed. After import, the pipeline can resume from where it left off if the run was partial.
 
 ## Output
 
@@ -148,6 +189,7 @@ src/
   storage/
     document_store.py        # JSON file-based storage
     vector_store.py          # ChromaDB vector store
+    archiver.py              # Run export/import (tar.gz archives)
   utils/
     provenance.py            # Provenance tracking and validation
     quality.py               # Quality gates (confidence, numerics, review)
